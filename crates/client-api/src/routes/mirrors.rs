@@ -9,6 +9,8 @@ use crate::NodeDelegate;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MirrorConnectivity {
+    /// Parked on the in-process subscribe gate, waiting for a free slot.
+    Waiting,
     Connecting,
     Subscribing,
     Live,

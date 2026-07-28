@@ -158,6 +158,19 @@ pub fn cli() -> clap::Command {
                 .action(SetTrue)
                 .help("In public-mirror-v1 mode, also reject OneOffQuery (allowed by default)"),
         )
+        .arg(
+            Arg::new("mirror_subscribe_concurrency")
+                .long("mirror-subscribe-concurrency")
+                .help(
+                    "Max number of mirrors that may connect/subscribe at once (default: 1). \
+                     A slot is held only until that mirror reaches live; concurrent live \
+                     mirrors are fine. Raise cautiously — concurrent large-shard seeds \
+                     tend to stall around the same heavy tables.",
+                )
+                .requires("public_mirror_v1")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("1"),
+        )
     // .after_help("Run `spacetime help start` for more detailed information.")
 }
 
@@ -223,6 +236,15 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     } else {
         None
     };
+    let mirror_subscribe_concurrency = if public_mirror_v1 {
+        let n = *args
+            .get_one::<usize>("mirror_subscribe_concurrency")
+            .unwrap_or(&1);
+        anyhow::ensure!(n >= 1, "--mirror-subscribe-concurrency must be >= 1");
+        n
+    } else {
+        1
+    };
 
     let page_pool_max_size = args
         .get_one::<String>("page_pool_max_size")
@@ -242,7 +264,11 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     println!("{} path: {}", exe_name, std::env::current_exe()?.display());
     println!("database running in data directory {}", data_dir.display());
     if let Some(ref mirrors) = mirrors {
-        println!("public-mirror-v1 mode: mirroring {} database(s):", mirrors.len());
+        println!(
+            "public-mirror-v1 mode: mirroring {} database(s) (subscribe concurrency {}):",
+            mirrors.len(),
+            mirror_subscribe_concurrency
+        );
         for m in mirrors {
             println!("  {} from {}", m.database, m.upstream);
         }
@@ -305,6 +331,11 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     worker_metrics::spawn_bsatn_rlb_pool_stats(listen_addr.clone(), ctx.bsatn_rlb_pool().clone());
 
     if let Some(mirrors) = mirrors {
+        let subscribe_gate = Arc::new(tokio::sync::Semaphore::new(mirror_subscribe_concurrency));
+        log::info!(
+            "public-mirror: subscribe concurrency gate = {mirror_subscribe_concurrency} \
+             (mirrors seed one slot at a time until live)"
+        );
         for m in &mirrors {
             bootstrap_public_mirror(
                 &ctx,
@@ -313,6 +344,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
                 mirror_token.as_deref(),
                 mirror_tables.clone(),
                 reject_one_off_query,
+                Arc::clone(&subscribe_gate),
             )
             .await
             .with_context(|| format!("failed to bootstrap public-mirror for `{}`", m.database))?;
@@ -640,6 +672,7 @@ async fn bootstrap_public_mirror(
     token: Option<&str>,
     tables: Option<Vec<String>>,
     reject_one_off_query: bool,
+    subscribe_gate: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<()> {
     log::info!("public-mirror: fetching schema for {mirror_database} from {upstream_url}");
     let (schema_bytes, module_def) = fetch_and_parse_schema(upstream_url, mirror_database)
@@ -721,7 +754,8 @@ async fn bootstrap_public_mirror(
         connect_timeout: Duration::from_secs(60),
     };
     tokio::spawn(async move {
-        if let Err(e) = run_public_mirror_loop(module_host, mirror_cfg, module_def, status).await {
+        if let Err(e) = run_public_mirror_loop(module_host, mirror_cfg, module_def, status, subscribe_gate).await
+        {
             log::error!("public-mirror upstream loop terminated: {e:#}");
         }
     });

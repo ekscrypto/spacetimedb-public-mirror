@@ -78,8 +78,14 @@ tables). Each mirrored database runs on its own JobCores thread.
 Clients connect to the local mirror by database name (`bitcraft-live-1`,
 `bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
-Per-mirror connectivity (connecting / subscribing / live / disconnected), table
-sync progress, transaction counts, and reconnect ETA are exposed at
+Initial connect/subscribe is gated by `--mirror-subscribe-concurrency` (default
+**1**): only that many mirrors may seed at once. A slot is released when a mirror
+reaches `live`, so others queue as `waiting` rather than flooding upstream with
+concurrent large-shard seeds (which tend to stall around the same heavy tables).
+Raise the concurrency only if you have evidence the upstream can absorb it.
+
+Per-mirror connectivity (waiting / connecting / subscribing / live / disconnected),
+table sync progress, transaction counts, and reconnect ETA are exposed at
 `GET /v1/mirrors` (JSON, unauthenticated — same posture as `/v1/metrics`).
 
 ### Compatibility harness

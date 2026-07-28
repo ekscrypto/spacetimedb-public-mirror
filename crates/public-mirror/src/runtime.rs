@@ -12,6 +12,7 @@ use spacetimedb::host::public_mirror::{ExternalProvenance, TableOps};
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_primitives::TableId;
 use spacetimedb_schema::def::ModuleDef;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::schema::public_user_table_names;
@@ -78,11 +79,16 @@ fn update_to_table_ops(
 ///
 /// Each apply is scheduled onto the mirror's dedicated [`spacetimedb::util::jobs::SingleThreadedExecutor`]
 /// via [`ModuleHost::apply_mirrored_update`], matching SpacetimeDB's one-thread-per-database model.
+///
+/// `subscribe_gate` serialises the connect/subscribe flood across mirrors in this process
+/// (same role as the relay-coordinator reconnect permit). The permit is held only until the
+/// mirror reaches `live`; concurrent live mirrors are fine.
 pub async fn run_public_mirror_loop(
     module_host: ModuleHost,
     config: PublicMirrorConfig,
     module_def: ModuleDef,
     status: MirrorStatusHandle,
+    subscribe_gate: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let tables = match config.tables {
         Some(t) if !t.is_empty() => t,
@@ -121,7 +127,7 @@ pub async fn run_public_mirror_loop(
 
     let upstream_cfg = UpstreamConfig {
         host: config.upstream,
-        database: config.database,
+        database: config.database.clone(),
         auth_token: config.auth_token,
         connect_timeout: config.connect_timeout,
     };
@@ -135,7 +141,7 @@ pub async fn run_public_mirror_loop(
     let mut backoff_secs: u64 = 1;
 
     loop {
-        status.set_connecting();
+        let permit = acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
         let mut live_started = None;
         let result = upstream::connect_and_mirror(
             upstream_cfg.clone(),
@@ -144,6 +150,7 @@ pub async fn run_public_mirror_loop(
             on_update.clone(),
             &mut live_started,
             status.clone(),
+            Some(permit),
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
@@ -168,6 +175,27 @@ pub async fn run_public_mirror_loop(
         tokio::time::sleep(sleep_for).await;
         backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
     }
+}
+
+async fn acquire_subscribe_slot(
+    gate: &Arc<Semaphore>,
+    database: &str,
+    status: &MirrorStatusHandle,
+) -> anyhow::Result<OwnedSemaphorePermit> {
+    status.set_waiting();
+    let available = gate.available_permits();
+    if available == 0 {
+        log::info!(
+            "public-mirror: `{database}` waiting for subscribe slot (all slots in use)"
+        );
+    }
+    let permit = Arc::clone(gate)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("subscribe gate closed"))?;
+    log::info!("public-mirror: `{database}` acquired subscribe slot");
+    status.set_connecting();
+    Ok(permit)
 }
 
 /// Convenience: hash schema bytes into a SpacetimeDB [`spacetimedb_lib::Hash`].

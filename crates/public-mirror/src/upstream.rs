@@ -17,6 +17,7 @@ use spacetimedb_lib::{bsatn, ConnectionId, Identity, ProductValue, Timestamp};
 use spacetimedb_sats::{ProductType, WithTypespace};
 use spacetimedb_schema::def::ModuleDef;
 use thiserror::Error;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
@@ -108,6 +109,10 @@ type ApplyFn = Arc<dyn Fn(UpstreamUpdate) -> BoxFuture<'static, Result<(), anyho
 /// When the live update loop begins, `live_started` is set to `Instant::now()` so the
 /// caller can measure how long the session was actually live (for reconnect backoff).
 /// It is left `None` if connect/subscribe fails before the live loop.
+///
+/// `subscribe_permit`, when present, is dropped as soon as all tables are subscribed
+/// (entering live) so another mirror can begin its seed. On connect/subscribe failure
+/// the permit is dropped by RAII when this function returns.
 pub async fn connect_and_mirror(
     config: UpstreamConfig,
     module_def: &ModuleDef,
@@ -115,6 +120,7 @@ pub async fn connect_and_mirror(
     on_update: ApplyFn,
     live_started: &mut Option<tokio::time::Instant>,
     status: MirrorStatusHandle,
+    mut subscribe_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     let row_types = build_row_types(module_def)?;
@@ -226,6 +232,8 @@ pub async fn connect_and_mirror(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
+    // Release the subscribe gate so the next queued mirror can start seeding.
+    drop(subscribe_permit.take());
     status.set_live();
     *live_started = Some(tokio::time::Instant::now());
 

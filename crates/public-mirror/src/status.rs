@@ -32,6 +32,7 @@ impl MirrorStatusInner {
         };
         let (connected_since, disconnected_since) = match self.connectivity {
             MirrorConnectivity::Disconnected => (None, self.disconnected_since.map(format_rfc3339)),
+            MirrorConnectivity::Waiting => (None, None),
             MirrorConnectivity::Connecting => (self.connected_since.map(format_rfc3339), None),
             MirrorConnectivity::Subscribing | MirrorConnectivity::Live => {
                 (self.connected_since.map(format_rfc3339), None)
@@ -106,6 +107,17 @@ pub struct MirrorStatusHandle {
 impl MirrorStatusHandle {
     fn with_mut<R>(&self, f: impl FnOnce(&mut MirrorStatusInner) -> R) -> R {
         f(&mut self.inner.lock().expect("mirror status poisoned"))
+    }
+
+    /// Queued behind the subscribe gate (another mirror is still seeding).
+    pub fn set_waiting(&self) {
+        self.with_mut(|s| {
+            s.connectivity = MirrorConnectivity::Waiting;
+            s.connected_since = None;
+            s.disconnected_since = None;
+            s.next_attempt_at = None;
+            s.tables_live = 0;
+        });
     }
 
     /// About to open (or re-open) the upstream WebSocket.
@@ -281,6 +293,18 @@ mod tests {
         let json = serde_json::to_value(&snap).unwrap();
         assert!(json["mirrors"][0]["connected_since"].is_string());
         assert!(json["mirrors"][1]["next_attempt_eta_secs"].is_number());
+    }
+
+    #[test]
+    fn waiting_clears_on_connect() {
+        let reg = MirrorStatusRegistry::new();
+        let host = Url::parse("wss://ea.example").unwrap();
+        let h = reg.register(&host, "db", 3);
+        h.set_waiting();
+        assert_eq!(reg.snapshot().mirrors[0].connectivity, MirrorConnectivity::Waiting);
+        assert_eq!(reg.snapshot().mirrors[0].tables_live, 0);
+        h.set_connecting();
+        assert_eq!(reg.snapshot().mirrors[0].connectivity, MirrorConnectivity::Connecting);
     }
 
     #[test]
