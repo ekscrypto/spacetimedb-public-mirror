@@ -792,7 +792,8 @@ impl HostController {
             return Ok(host.module.borrow().clone());
         }
 
-        let (tx_metrics_queue, tx_metrics_recorder_task) = spawn_tx_metrics_recorder();
+        let runtime = spacetimedb_runtime::Handle::tokio_current();
+        let (tx_metrics_queue, tx_metrics_recorder_task) = spawn_tx_metrics_recorder(&runtime);
         let (db, _connected_clients) = RelationalDB::open(
             database.database_identity,
             database.owner_identity,
@@ -801,6 +802,7 @@ impl HostController {
             Some(tx_metrics_queue),
             self.page_pool.clone(),
         )?;
+        let db = db.with_memory_observer(self.memory_observer.clone());
 
         public_mirror::create_tables_from_module_def(&db, &module_def)?;
 
@@ -811,6 +813,7 @@ impl HostController {
             replica_id,
             relational_db,
             self.bsatn_rlb_pool.clone(),
+            self.memory_observer.clone(),
         )
         .await
         .map(Arc::new)?;
@@ -835,8 +838,9 @@ impl HostController {
         );
 
         scheduler_starter.start(&module_host)?;
-        let disk_metrics_recorder_task = tokio::spawn(metric_reporter(replica_ctx.clone())).abort_handle();
-        let view_cleanup_task = spawn_view_cleanup_loop(replica_ctx.relational_db().clone());
+        let disk_metrics_recorder_task: spacetimedb_runtime::AbortHandle =
+            tokio::spawn(metric_reporter(replica_ctx.clone())).abort_handle().into();
+        let view_cleanup_task = spawn_view_cleanup_loop(replica_ctx.relational_db().clone(), &runtime);
 
         let host = Host {
             module: watch::Sender::new(module_host.clone()),

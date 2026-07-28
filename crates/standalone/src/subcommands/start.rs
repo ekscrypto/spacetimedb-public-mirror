@@ -602,6 +602,7 @@ async fn bootstrap_public_mirror(
         owner_identity,
         host_type: HostType::Mirror,
         initial_program,
+        bootstrap_generation: 0,
     };
 
     let control = ctx.control_db();

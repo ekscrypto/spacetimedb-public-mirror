@@ -1,7 +1,7 @@
 # spacetimedb-public-mirror
 
 Unofficial public fork of [Clockwork Labs SpacetimeDB](https://github.com/clockworklabs/SpacetimeDB),
-pinned at tag **v2.6.1**.
+pinned at tag **v2.7.1**.
 
 ## Purpose
 

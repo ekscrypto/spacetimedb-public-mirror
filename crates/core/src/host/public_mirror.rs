@@ -4,7 +4,7 @@
 //! broadcasts [`ModuleEvent`]s that preserve upstream reducer provenance.
 
 use super::module_host::{
-    create_table_from_def, create_table_from_view_def, DatabaseUpdate, EventStatus, ModuleEvent, ModuleFunctionCall,
+    create_table_from_view_def, DatabaseUpdate, EventStatus, ModuleEvent, ModuleFunctionCall,
 };
 use super::ArgsTuple;
 use crate::db::relational_db::RelationalDB;
@@ -110,7 +110,7 @@ pub fn create_tables_from_module_def(stdb: &RelationalDB, module_def: &ModuleDef
         let mut table_defs: Vec<_> = module_def.tables().collect();
         table_defs.sort_by_key(|x| &x.name);
         for def in table_defs {
-            create_table_from_def(stdb, tx, module_def, def)?;
+            spacetimedb_engine::update::create_table_from_def(stdb, tx, module_def, def)?;
         }
 
         let mut view_defs: Vec<_> = module_def.views().collect();
