@@ -87,6 +87,12 @@ Raise the concurrency only if you have evidence the upstream can absorb it.
 Per-mirror connectivity (waiting / connecting / subscribing / live / disconnected),
 table sync progress, transaction counts, and reconnect ETA are exposed at
 `GET /v1/mirrors` (JSON, unauthenticated — same posture as `/v1/metrics`).
+While `subscribing`, the response also includes the current table name/phase,
+socket bytes received since that subscribe started, and `last_byte_at` so you
+can tell a slowly arriving seed from a hung connection. Large full-table seeds
+(e.g. `location_state`) are kept: the upstream client leaves tungstenite
+message/frame caps unlimited, never splits the WebSocket (so auto-Pongs flush
+mid-reassembly), and keeps client Pings flowing during seed wait and apply.
 
 ### Compatibility harness
 

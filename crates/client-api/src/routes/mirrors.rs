@@ -17,6 +17,16 @@ pub enum MirrorConnectivity {
     Disconnected,
 }
 
+/// Sub-phase while `connectivity == subscribing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscribePhase {
+    /// Waiting for `SubscribeMultiApplied` (seed may still be arriving on the wire).
+    AwaitingSeed,
+    /// Seed message received; applying rows into the local mirror DB.
+    ApplyingSeed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MirrorStatusSnapshot {
     pub host: String,
@@ -33,6 +43,21 @@ pub struct MirrorStatusSnapshot {
     pub tables_live: u32,
     pub tables_total: u32,
     pub transactions_processed: u64,
+    /// Table whose subscribe is currently in progress (mainly while `subscribing`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table_phase: Option<SubscribePhase>,
+    /// Socket bytes read since this table's subscribe was sent (framing + interleaved TUs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table_bytes_received: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_byte_at: Option<String>,
+    /// Row count from `SubscribeMultiApplied`, set while `applying_seed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table_seed_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
