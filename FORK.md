@@ -79,12 +79,12 @@ Clients connect to the local mirror by database name (`bitcraft-live-1`,
 `bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
 Initial connect/subscribe is gated by `--mirror-subscribe-concurrency` (default
-**1**): only that many mirrors may hold a **wire-seed** slot at once (connect +
-awaiting each table's `SubscribeMultiApplied`). The slot is **released before
-local seed apply**, so a multi-minute `location_state` insert cannot park every
-other mirror in `waiting`. Reconnecting mirrors may show `current_table_phase:
-queued` while they wait for the next free wire slot; `tables_live` is preserved
-and live TUs for already-subscribed tables keep applying while queued.
+**1**): only that many mirrors may **set up mirroring** at once. A slot is
+acquired before connecting and held for the entire setup phase — connect, every
+table's wire seed, and every local seed apply — then released only when the
+mirror goes live. Live mirrors never hold a slot; a mirror that disconnects
+must reacquire one (after backoff) before reconnecting, and shows `waiting`
+until it does.
 
 **WebSocket servicing is never blocked on database work.** The socket loop only
 reads, decodes, and enqueues; applies run from a FIFO queue whose in-flight job

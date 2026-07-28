@@ -36,7 +36,7 @@ use spacetimedb_schema::def::ModuleDef;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{client_async_tls_with_config, WebSocketStream};
@@ -196,10 +196,12 @@ type ApplyFn = Arc<
 /// that table's name so the caller can prioritize it (subscribe it first, while the
 /// connection is freshest) on the next attempt.
 ///
-/// `subscribe_gate` limits concurrent **wire** seeds (and the initial connect). The permit
-/// is released before each local seed apply so a multi-minute `location_state` insert
-/// cannot block other mirrors from reconnecting. On failure the held permit (if any)
-/// is dropped by RAII when this function returns.
+/// `subscribe_permit` is the subscribe-gate slot acquired by the caller before
+/// connecting. It is held for the **entire setup phase** — connect, every
+/// table's wire seed, and every local seed apply — and released only when the
+/// session goes live, so exactly one mirror sets up mirroring at a time. On
+/// failure the permit is dropped by RAII when this function returns, letting
+/// the next waiting mirror proceed.
 ///
 /// **Live invariant:** once this session reaches `status.set_live()`, it never
 /// reacquires the gate until disconnect. Another mirror's subscribe/seed must not
@@ -214,8 +216,7 @@ pub async fn connect_and_mirror(
     live_started: &mut Option<tokio::time::Instant>,
     failed_table: &mut Option<String>,
     status: MirrorStatusHandle,
-    subscribe_gate: Arc<Semaphore>,
-    subscribe_permit: Option<OwnedSemaphorePermit>,
+    subscribe_permit: OwnedSemaphorePermit,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     *failed_table = None;
@@ -280,7 +281,7 @@ pub async fn connect_and_mirror(
         counter,
     };
 
-    let result = mirror_session(&mut ctx, tables, live_started, failed_table, subscribe_gate, subscribe_permit).await;
+    let result = mirror_session(&mut ctx, tables, live_started, failed_table, subscribe_permit).await;
 
     // Apply whatever was already received and decoded before tearing down, so a
     // reconnect's re-seed starts from the freshest local state and the next
@@ -295,8 +296,7 @@ async fn mirror_session<S>(
     tables: &[String],
     live_started: &mut Option<tokio::time::Instant>,
     failed_table: &mut Option<String>,
-    subscribe_gate: Arc<Semaphore>,
-    mut subscribe_permit: Option<OwnedSemaphorePermit>,
+    subscribe_permit: OwnedSemaphorePermit,
 ) -> Result<(), UpstreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -304,9 +304,7 @@ where
     ctx.await_identity_token().await?;
 
     for (idx, table) in tables.iter().enumerate() {
-        if let Err(e) =
-            subscribe_table(ctx, &subscribe_gate, &mut subscribe_permit, table, idx, tables.len()).await
-        {
+        if let Err(e) = subscribe_table(ctx, table, idx, tables.len()).await {
             *failed_table = Some(table.clone());
             return Err(e);
         }
@@ -316,29 +314,23 @@ where
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
-    // Live invariant: permit must be gone; this session will not touch the gate
-    // again until disconnect → reconnect (which may wait disconnected).
-    debug_assert!(
-        subscribe_permit.is_none(),
-        "subscribe gate must be released before live loop"
-    );
-    drop(subscribe_permit.take());
+    // Setup is complete: release the gate so the next mirror can start its
+    // own setup. Live invariant: this session will not touch the gate again
+    // until disconnect → reconnect (which waits disconnected).
+    drop(subscribe_permit);
     ctx.status.set_live();
     *live_started = Some(tokio::time::Instant::now());
 
     ctx.live_loop().await
 }
 
-/// Subscribe one table: acquire a wire slot, send `SubscribeMulti`, await the
-/// seed snapshot, then enqueue it and wait for the local apply to finish.
+/// Subscribe one table: send `SubscribeMulti`, await the seed snapshot, then
+/// enqueue it and wait for the local apply to finish.
 ///
-/// The gate permit is held only for the wire portion (subscribe → seed frame
-/// fully received); it is released before the local apply so other mirrors can
-/// use the upstream while this one inserts.
+/// The caller holds the subscribe-gate permit for the whole setup phase, so
+/// this function never touches the gate.
 async fn subscribe_table<S>(
     ctx: &mut SessionCtx<S>,
-    subscribe_gate: &Arc<Semaphore>,
-    subscribe_permit: &mut Option<OwnedSemaphorePermit>,
     table: &str,
     idx: usize,
     total: usize,
@@ -346,23 +338,6 @@ async fn subscribe_table<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Hold the gate only for the wire seed. Release before local apply so a
-    // multi-minute insert cannot park every reconnecting mirror behind us.
-    // While queued, keep applying live TUs for tables already subscribed —
-    // parking on acquire alone would freeze mid-subscribe progress.
-    if subscribe_permit.is_none() {
-        if subscribe_gate.available_permits() == 0 {
-            log::info!(
-                "public-mirror: queued for subscribe slot before [{}/{}] {table} ({} tables already live)",
-                idx + 1,
-                total,
-                idx
-            );
-            ctx.status.set_queued_for_subscribe_slot();
-        }
-        *subscribe_permit = Some(ctx.acquire_subscribe_slot(subscribe_gate).await?);
-    }
-
     let request_id = (idx as u32).saturating_add(1);
     let query_id = request_id;
     let query = format!("SELECT * FROM {table}");
@@ -377,10 +352,6 @@ where
 
     let (mut tables_ops, n_rows, wire_bytes) = ctx.await_seed(query_id, table).await?;
     log::info!("public-mirror: SubscribeMultiApplied for {table} ({n_rows} seed rows, {wire_bytes} wire bytes)");
-
-    // Free the slot before local apply — reconnecting mirrors can proceed.
-    // Live mirrors never hold this gate; do not reacquire after set_live().
-    drop(subscribe_permit.take());
 
     // An empty seed must still clear the local table: after a reconnect the
     // previous session's rows may be stale (upstream table now empty).
@@ -531,34 +502,6 @@ where
                     }
                 }
                 Event::Applied | Event::Tick => {}
-            }
-        }
-    }
-
-    /// Wait for a subscribe-gate permit without freezing already-subscribed
-    /// tables: interleaved live TUs keep applying and Pings keep flowing.
-    async fn acquire_subscribe_slot(&mut self, gate: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, UpstreamError> {
-        enum SlotEvent {
-            Permit(Result<OwnedSemaphorePermit, tokio::sync::AcquireError>),
-            Session(Result<Event, UpstreamError>),
-        }
-        let acquire = Arc::clone(gate).acquire_owned();
-        futures::pin_mut!(acquire);
-        loop {
-            let raw = tokio::select! {
-                biased;
-                permit = &mut acquire => SlotEvent::Permit(permit),
-                ev = self.next_event() => SlotEvent::Session(ev),
-            };
-            match raw {
-                SlotEvent::Permit(permit) => {
-                    return permit.map_err(|_| UpstreamError::Closed("subscribe gate closed".into()));
-                }
-                SlotEvent::Session(ev) => {
-                    if let Event::Frame(frame) = ev? {
-                        self.handle_background_frame(frame)?;
-                    }
-                }
             }
         }
     }

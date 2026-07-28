@@ -289,18 +289,6 @@ impl MirrorStatusHandle {
         });
     }
 
-    /// Connected but waiting for a subscribe-gate slot before the next table seed.
-    /// Preserves `tables_live` (unlike [`Self::set_waiting`]).
-    pub fn set_queued_for_subscribe_slot(&self) {
-        self.with_mut(|s| {
-            s.connectivity = MirrorConnectivity::Subscribing;
-            s.disconnected_since = None;
-            s.next_attempt_at = None;
-            s.clear_current_table();
-            s.current_table_phase = Some(SubscribePhase::Queued);
-        });
-    }
-
     /// Begin awaiting seed for `table` (baselines byte counter).
     pub fn set_subscribing_table(&self, table: impl Into<String>) {
         self.with_mut(|s| {
@@ -319,8 +307,6 @@ impl MirrorStatusHandle {
     }
 
     /// Seed message decoded; applying into the local DB.
-    /// Caller should have released the subscribe gate before this — local apply
-    /// must not block other mirrors from reconnecting.
     ///
     /// Returns shared counters the apply job updates so `/v1/mirrors` can show
     /// insert progress on huge tables.
@@ -575,16 +561,8 @@ mod tests {
         assert!(m.current_table_bytes_received.is_none());
         assert!(m.current_table_seed_rows_applied.is_none());
 
-        // Mid-subscribe queue for the next wire slot must preserve tables_live.
-        h.set_queued_for_subscribe_slot();
-        let m = &reg.snapshot().mirrors[0];
-        assert_eq!(m.connectivity, MirrorConnectivity::Subscribing);
-        assert_eq!(m.current_table_phase, Some(SubscribePhase::Queued));
-        assert_eq!(m.tables_live, 1);
-        assert!(m.current_table.is_none());
-
         let json = serde_json::to_value(reg.snapshot()).unwrap();
         assert!(json["mirrors"][0].get("current_table").is_none());
-        assert_eq!(json["mirrors"][0]["current_table_phase"], "queued");
+        assert!(json["mirrors"][0].get("current_table_phase").is_none());
     }
 }

@@ -87,8 +87,11 @@ fn update_to_mirrored(update: UpstreamUpdate, table_ids: &HashMap<String, TableI
 /// [`ModuleHost::apply_mirrored_updates`], matching SpacetimeDB's one-thread-per-database
 /// model while amortizing the cross-thread round trip when a backlog has built up.
 ///
-/// `subscribe_gate` serialises concurrent **wire** seeds (and initial connect) across mirrors.
-/// The permit is released before each local seed apply so a long insert cannot block reconnects.
+/// `subscribe_gate` serialises the whole setup phase across mirrors: a permit is
+/// acquired before connecting and held through every table's wire seed and local
+/// apply, released only when the mirror goes live. A live mirror never touches
+/// the gate again until it disconnects, at which point it must reacquire a
+/// permit (after backoff) before reconnecting.
 pub async fn run_public_mirror_loop(
     module_host: ModuleHost,
     config: PublicMirrorConfig,
@@ -175,8 +178,7 @@ pub async fn run_public_mirror_loop(
             &mut live_started,
             &mut failed_table,
             status.clone(),
-            Arc::clone(&subscribe_gate),
-            Some(permit),
+            permit,
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
