@@ -107,13 +107,10 @@ pub async fn run_public_mirror_loop(
             if ops.is_empty() {
                 return Ok(());
             }
-            let n_ins: usize = ops.iter().map(|o| o.inserts.len()).sum();
-            let n_del: usize = ops.iter().map(|o| o.deletes.len()).sum();
             module_host
                 .apply_mirrored_update(provenance, ops)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
-            log::debug!("public-mirror: applied update (+{n_ins} -{n_del})");
             Ok(())
         }
         .boxed()
