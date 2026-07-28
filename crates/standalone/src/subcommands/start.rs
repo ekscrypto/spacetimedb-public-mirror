@@ -111,23 +111,21 @@ pub fn cli() -> clap::Command {
                 ),
         )
         .arg(
-            Arg::new("mirror_upstream")
-                .long("mirror-upstream")
-                .help("Upstream SpacetimeDB host URL (wss://… or https://…) for --public-mirror-v1")
-                .requires("public_mirror_v1"),
-        )
-        .arg(
-            Arg::new("mirror_database")
-                .long("mirror-database")
-                .help("Upstream database name to mirror for --public-mirror-v1")
-                .requires("public_mirror_v1"),
+            Arg::new("mirror")
+                .long("mirror")
+                .help(
+                    "Upstream to mirror as <upstream-url>/<database-name> (repeatable). \
+                     Example: wss://host.example/bitcraft-live-1. Requires --public-mirror-v1.",
+                )
+                .requires("public_mirror_v1")
+                .action(clap::ArgAction::Append),
         )
         .arg(
             Arg::new("mirror_token")
                 .long("mirror-token")
                 .help(
                     "Bearer token for upstream auth (also BITCRAFT_TOKEN or MIRROR_TOKEN env). \
-                     Optional for --public-mirror-v1",
+                     Optional for --public-mirror-v1; shared by all --mirror entries",
                 )
                 .requires("public_mirror_v1"),
         )
@@ -145,7 +143,7 @@ pub fn cli() -> clap::Command {
             Arg::new("mirror_table")
                 .long("mirror-table")
                 .help(
-                    "Restrict upstream subscribe to these public tables (repeatable). \
+                    "Restrict upstream subscribe to these public tables (repeatable; applies to every --mirror). \
                      Default: all public user tables.",
                 )
                 .requires("public_mirror_v1")
@@ -205,23 +203,23 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
         Storage::Disk
     };
 
-    let mirror_upstream = args.get_one::<String>("mirror_upstream").cloned();
-    let mirror_database = args.get_one::<String>("mirror_database").cloned();
     let mirror_tables: Option<Vec<String>> = args
         .get_many::<String>("mirror_table")
         .map(|vals| vals.cloned().collect());
     let mirror_token = resolve_mirror_token(args)?;
-
-    if public_mirror_v1 {
+    let mirrors = if public_mirror_v1 {
+        let raw: Vec<String> = args
+            .get_many::<String>("mirror")
+            .map(|vals| vals.cloned().collect())
+            .unwrap_or_default();
         anyhow::ensure!(
-            mirror_upstream.is_some(),
-            "--public-mirror-v1 requires --mirror-upstream"
+            !raw.is_empty(),
+            "--public-mirror-v1 requires at least one --mirror <upstream-url>/<database>"
         );
-        anyhow::ensure!(
-            mirror_database.is_some(),
-            "--public-mirror-v1 requires --mirror-database"
-        );
-    }
+        Some(parse_mirror_specs(&raw)?)
+    } else {
+        None
+    };
 
     let page_pool_max_size = args
         .get_one::<String>("page_pool_max_size")
@@ -240,12 +238,11 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     println!("{} version: {}", exe_name, env!("CARGO_PKG_VERSION"));
     println!("{} path: {}", exe_name, std::env::current_exe()?.display());
     println!("database running in data directory {}", data_dir.display());
-    if public_mirror_v1 {
-        println!(
-            "public-mirror-v1 mode: mirroring {} from {}",
-            mirror_database.as_deref().unwrap_or("?"),
-            mirror_upstream.as_deref().unwrap_or("?")
-        );
+    if let Some(ref mirrors) = mirrors {
+        println!("public-mirror-v1 mode: mirroring {} database(s):", mirrors.len());
+        for m in mirrors {
+            println!("  {} from {}", m.database, m.upstream);
+        }
     }
 
     let config_path = data_dir.config_toml();
@@ -304,16 +301,19 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     worker_metrics::spawn_page_pool_stats(listen_addr.clone(), ctx.page_pool().clone());
     worker_metrics::spawn_bsatn_rlb_pool_stats(listen_addr.clone(), ctx.bsatn_rlb_pool().clone());
 
-    if public_mirror_v1 {
-        bootstrap_public_mirror(
-            &ctx,
-            mirror_upstream.as_deref().unwrap(),
-            mirror_database.as_deref().unwrap(),
-            mirror_token.as_deref(),
-            mirror_tables,
-            reject_one_off_query,
-        )
-        .await?;
+    if let Some(mirrors) = mirrors {
+        for m in &mirrors {
+            bootstrap_public_mirror(
+                &ctx,
+                &m.upstream,
+                &m.database,
+                mirror_token.as_deref(),
+                mirror_tables.clone(),
+                reject_one_off_query,
+            )
+            .await
+            .with_context(|| format!("failed to bootstrap public-mirror for `{}`", m.database))?;
+        }
     }
 
     let mut db_routes = DatabaseRoutes::default();
@@ -573,17 +573,71 @@ fn prompt_yes_no(question: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
+/// One `--mirror <upstream-url>/<database-name>` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirrorSpec {
+    upstream: Url,
+    database: String,
+}
+
+/// Parse `--mirror` values of the form `<upstream-url>/<database-name>`.
+///
+/// The last non-empty path segment is the database name; the URL with that
+/// segment stripped is the upstream host (scheme + authority + any path prefix).
+fn parse_mirror_spec(raw: &str) -> anyhow::Result<MirrorSpec> {
+    let url = Url::parse(raw).with_context(|| format!("invalid --mirror URL `{raw}`"))?;
+    let mut segments: Vec<String> = url
+        .path_segments()
+        .ok_or_else(|| anyhow::anyhow!("--mirror `{raw}` must be an absolute URL with a path"))?
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let database = segments
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("--mirror `{raw}` must end with /<database-name>"))?;
+
+    let mut upstream = url.clone();
+    {
+        let mut path = upstream.path_segments_mut().map_err(|_| {
+            anyhow::anyhow!("--mirror `{raw}`: cannot modify path (is the URL a base URL?)")
+        })?;
+        path.clear();
+        for seg in &segments {
+            path.push(seg);
+        }
+        // Keep a trailing slash so `wss://host/` stays a valid join base.
+        path.push("");
+    }
+
+    Ok(MirrorSpec { upstream, database })
+}
+
+fn parse_mirror_specs(raw: &[String]) -> anyhow::Result<Vec<MirrorSpec>> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut seen = std::collections::HashSet::new();
+    for entry in raw {
+        let spec = parse_mirror_spec(entry)?;
+        if !seen.insert(spec.database.clone()) {
+            anyhow::bail!(
+                "duplicate --mirror database name `{}` (each local mirror must have a unique name)",
+                spec.database
+            );
+        }
+        out.push(spec);
+    }
+    Ok(out)
+}
+
 async fn bootstrap_public_mirror(
     ctx: &StandaloneEnv,
-    upstream: &str,
+    upstream_url: &Url,
     mirror_database: &str,
     token: Option<&str>,
     tables: Option<Vec<String>>,
     reject_one_off_query: bool,
 ) -> anyhow::Result<()> {
-    let upstream_url = Url::parse(upstream).context("invalid --mirror-upstream URL")?;
     log::info!("public-mirror: fetching schema for {mirror_database} from {upstream_url}");
-    let (schema_bytes, module_def) = fetch_and_parse_schema(&upstream_url, mirror_database)
+    let (schema_bytes, module_def) = fetch_and_parse_schema(upstream_url, mirror_database)
         .await
         .context("failed to fetch/parse upstream schema")?;
     log::info!(
@@ -615,7 +669,7 @@ async fn bootstrap_public_mirror(
 
     // Ensure clients can connect by name.
     let domain = DatabaseName::from_str(mirror_database)
-        .context("invalid --mirror-database name")?
+        .with_context(|| format!("invalid --mirror database name `{mirror_database}`"))?
         .into();
     match control.spacetime_insert_domain(&database_identity, domain, owner_identity, true) {
         Ok(_) => log::info!("public-mirror: registered domain `{mirror_database}`"),
@@ -647,7 +701,7 @@ async fn bootstrap_public_mirror(
         .context("bootstrap_mirror_database failed")?;
 
     let mirror_cfg = PublicMirrorConfig {
-        upstream: upstream_url,
+        upstream: upstream_url.clone(),
         database: mirror_database.to_string(),
         auth_token: token.map(str::to_string),
         tables,
@@ -658,7 +712,7 @@ async fn bootstrap_public_mirror(
             log::error!("public-mirror upstream loop terminated: {e:#}");
         }
     });
-    log::info!("public-mirror: upstream apply loop spawned");
+    log::info!("public-mirror: upstream apply loop spawned for `{mirror_database}`");
     Ok(())
 }
 
@@ -848,5 +902,48 @@ mod tests {
             Some(16 * 1024)
         );
         assert_eq!(config.commitlog.offset_index_require_segment_fsync, Some(true));
+    }
+
+    #[test]
+    fn parse_mirror_spec_happy_path() {
+        let spec = parse_mirror_spec("wss://ea.example/bitcraft-live-global").unwrap();
+        assert_eq!(spec.database, "bitcraft-live-global");
+        assert_eq!(spec.upstream.as_str(), "wss://ea.example/");
+    }
+
+    #[test]
+    fn parse_mirror_spec_path_prefix() {
+        let spec = parse_mirror_spec("https://other.host:443/prefix/bitcraft-live-7").unwrap();
+        assert_eq!(spec.database, "bitcraft-live-7");
+        assert_eq!(spec.upstream.as_str(), "https://other.host/prefix/");
+    }
+
+    #[test]
+    fn parse_mirror_spec_missing_database() {
+        assert!(parse_mirror_spec("wss://ea.example/").is_err());
+        assert!(parse_mirror_spec("wss://ea.example").is_err());
+    }
+
+    #[test]
+    fn parse_mirror_specs_rejects_duplicate_database() {
+        let raw = vec![
+            "wss://a.example/bitcraft-live-1".to_string(),
+            "wss://b.example/bitcraft-live-1".to_string(),
+        ];
+        let err = parse_mirror_specs(&raw).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("bitcraft-live-1"), "{err}");
+    }
+
+    #[test]
+    fn parse_mirror_specs_accepts_distinct_databases() {
+        let raw = vec![
+            "wss://a.example/bitcraft-live-global".to_string(),
+            "wss://a.example/bitcraft-live-1".to_string(),
+        ];
+        let specs = parse_mirror_specs(&raw).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].database, "bitcraft-live-global");
+        assert_eq!(specs[1].database, "bitcraft-live-1");
     }
 }

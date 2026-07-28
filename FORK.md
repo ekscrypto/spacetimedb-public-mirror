@@ -51,27 +51,31 @@ cargo build -p spacetimedb-standalone --release
 
 # Prefer the fleet developer JWT (not the Unity PlayerPrefs player token).
 # Multi-line token files are OK: the first eyJ… line is used.
+# Repeat --mirror for each upstream database; one process serves them all
+# on a single --listen-addr (clients select by database name).
 ./target/release/spacetimedb-standalone start \
   --data-dir /tmp/public-mirror-data \
   --listen-addr 127.0.0.1:3001 \
   --jwt-pub-key-path /path/to/id_ecdsa.pub \
   --jwt-priv-key-path /path/to/id_ecdsa \
   --public-mirror-v1 \
-  --mirror-upstream wss://bitcraft-early-access.spacetimedb.com \
-  --mirror-database bitcraft-live-1 \
   --mirror-token-file /path/to/.developer-token \
+  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-global \
+  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-1 \
   --mirror-table player_username_state \
   --mirror-table player_state
 ```
 
 `--public-mirror-v1` forces in-memory storage. `CallReducer` / `CallProcedure` are
 always rejected. Pass `--reject-one-off-query` to also reject `OneOffQuery`
-(allowed by default). Token may also come from `--mirror-token`, `BITCRAFT_TOKEN`,
-`MIRROR_TOKEN`, or `MIRROR_TOKEN_FILE`. Use `--mirror-table` to limit the
-upstream subscribe set (default: all public user tables).
+(allowed by default). Each `--mirror` is `<upstream-url>/<database-name>`; token
+and `--mirror-table` are shared across all mirrors. Token may also come from
+`--mirror-token`, `BITCRAFT_TOKEN`, `MIRROR_TOKEN`, or `MIRROR_TOKEN_FILE`. Use
+`--mirror-table` to limit the upstream subscribe set (default: all public user
+tables). Each mirrored database runs on its own JobCores thread.
 
-Clients connect to the local mirror by database name (`bitcraft-live-1`) on the
-listen address, speaking `v1.bsatn.spacetimedb`.
+Clients connect to the local mirror by database name (`bitcraft-live-1`,
+`bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
 ### Compatibility harness
 
