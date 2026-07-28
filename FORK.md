@@ -83,7 +83,16 @@ Initial connect/subscribe is gated by `--mirror-subscribe-concurrency` (default
 awaiting each table's `SubscribeMultiApplied`). The slot is **released before
 local seed apply**, so a multi-minute `location_state` insert cannot park every
 other mirror in `waiting`. Reconnecting mirrors may show `current_table_phase:
-queued` while they wait for the next free wire slot; `tables_live` is preserved.
+queued` while they wait for the next free wire slot; `tables_live` is preserved
+and live TUs for already-subscribed tables keep applying while queued.
+
+**Live invariant:** once a mirror reaches `live`, it does not touch the subscribe
+gate again until disconnect/reconnect. Another mirror's subscribe or seed must
+not block that database's table updates (dedicated JobCores thread per DB; large
+seed BSATN decode runs on Tokio's blocking pool so shared async workers stay
+free for live WebSocket tasks). It is OK for a *disconnected* mirror to stay
+`waiting` until a subscribe slot opens.
+
 Raise the concurrency only if you have evidence the upstream can absorb concurrent
 large-shard wire seeds.
 

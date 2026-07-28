@@ -22,8 +22,9 @@ pub enum MirrorConnectivity {
 #[serde(rename_all = "snake_case")]
 pub enum SubscribePhase {
     /// Connected, but parked on the subscribe gate before the next table's wire seed.
-    /// Does not clear `tables_live` — used so a long local apply on another mirror
-    /// cannot block reconnects for the whole remaining table list.
+    /// Does not clear `tables_live` — live TUs for already-subscribed tables keep
+    /// applying while queued. A long wire seed on another mirror must not freeze
+    /// this mirror's already-live tables (and must never affect a fully `live` DB).
     Queued,
     /// Waiting for `SubscribeMultiApplied` (seed may still be arriving on the wire).
     AwaitingSeed,

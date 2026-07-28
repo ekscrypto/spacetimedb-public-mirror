@@ -70,9 +70,11 @@ pub fn apply_external_update(
     let stdb = subs.relational_db();
     let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
 
-    // Yield / report periodically so a multi-million-row seed insert cannot
-    // starve other mirrors' WebSocket ping/pong tasks, and so `/v1/mirrors`
-    // can show forward progress during `applying_seed`.
+    // Yield / report periodically so a multi-million-row seed insert yields the
+    // dedicated JobCores thread under CPU contention, and so `/v1/mirrors`
+    // can show forward progress during `applying_seed`. (Other mirrors' live
+    // WS tasks run on the shared Tokio runtime + their own JobCores threads;
+    // they are not scheduled on this thread.)
     const PROGRESS_EVERY: u64 = 50_000;
     let mut total_applied = 0u64;
     let mut since_tick = 0u64;

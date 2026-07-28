@@ -39,6 +39,11 @@ const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
 /// (`location_state` ~1 GiB+) can take many minutes to finish on the wire.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Seed frames at/above this size are BSATN-decoded on the blocking pool so a
+/// multi-second CPU decode cannot stall other mirrors' live WebSocket tasks on
+/// the shared Tokio runtime. Live transaction updates stay well under this.
+const OFFLOAD_SEED_DECODE_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub host: Url,
@@ -134,6 +139,11 @@ type ApplyFn = Arc<
 /// is released before each local seed apply so a multi-minute `location_state` insert
 /// cannot block other mirrors from reconnecting. On failure the held permit (if any)
 /// is dropped by RAII when this function returns.
+///
+/// **Live invariant:** once this session reaches `status.set_live()`, it never
+/// reacquires the gate until disconnect. Another mirror's subscribe/seed must not
+/// stall live applies — those run on this DB's JobCores thread, and large seed
+/// decode is offloaded off the shared Tokio runtime.
 pub async fn connect_and_mirror(
     config: UpstreamConfig,
     module_def: &ModuleDef,
@@ -227,6 +237,8 @@ pub async fn connect_and_mirror(
     for (idx, table) in tables.iter().enumerate() {
         // Hold the gate only for the wire seed. Release before local apply so a
         // multi-minute insert cannot park every reconnecting mirror behind us.
+        // While queued, keep applying live TUs for tables already subscribed —
+        // parking on acquire alone would freeze mid-subscribe progress.
         if subscribe_permit.is_none() {
             if subscribe_gate.available_permits() == 0 {
                 log::info!(
@@ -240,10 +252,15 @@ pub async fn connect_and_mirror(
                 status.set_queued_for_subscribe_slot();
             }
             subscribe_permit = Some(
-                Arc::clone(&subscribe_gate)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| UpstreamError::Closed("subscribe gate closed".into()))?,
+                acquire_subscribe_slot_keeping_alive(
+                    &mut sock,
+                    &subscribe_gate,
+                    &row_types,
+                    &on_update,
+                    &status,
+                    &mut ping_interval,
+                )
+                .await?,
             );
         }
 
@@ -269,38 +286,25 @@ pub async fn connect_and_mirror(
             tokio::select! {
                 msg = next_binary(&mut sock) => {
                     let msg = msg?;
-                    let server = decode_server_message(&msg)?;
-                    match server {
-                        ServerMessage::SubscribeMultiApplied(sma) => {
-                            if sma.query_id.id != query_id {
-                                log::warn!(
-                                    "public-mirror: unexpected SubscribeMultiApplied query_id={} (want {query_id})",
-                                    sma.query_id.id
-                                );
-                                continue;
-                            }
-                            let tables_ops =
-                                database_update_to_ops(&sma.update, &row_types, /*seed*/ true)?;
-                            let n_rows: usize = tables_ops.iter().map(|t| t.inserts.len()).sum();
+                    let outcome = decode_subscribe_wait_message(
+                        msg,
+                        query_id,
+                        &row_types,
+                        &mut sock,
+                        &on_update,
+                        &status,
+                        &mut ping_interval,
+                    )
+                    .await?;
+                    match outcome {
+                        SubscribeWaitOutcome::Seed { tables_ops, n_rows, wire_bytes } => {
                             log::info!(
-                                "public-mirror: SubscribeMultiApplied for {table} ({n_rows} seed rows, {} wire bytes)",
-                                msg.len()
+                                "public-mirror: SubscribeMultiApplied for {table} \
+                                 ({n_rows} seed rows, {wire_bytes} wire bytes)"
                             );
                             break (tables_ops, n_rows);
                         }
-                        ServerMessage::SubscriptionError(err) => {
-                            return Err(UpstreamError::Subscription(err.error.to_string()));
-                        }
-                        ServerMessage::TransactionUpdate(_) | ServerMessage::TransactionUpdateLight(_) => {
-                            handle_live_update(server, &row_types, &on_update, &status).await?;
-                        }
-                        ServerMessage::IdentityToken(_) => {}
-                        other => {
-                            log::debug!(
-                                "public-mirror: ignoring while awaiting subscribe: {}",
-                                variant_name(&other)
-                            );
-                        }
+                        SubscribeWaitOutcome::Handled => {}
                     }
                 }
                 _ = ping_interval.tick() => {
@@ -310,6 +314,7 @@ pub async fn connect_and_mirror(
         };
 
         // Free the slot before local apply — reconnecting mirrors can proceed.
+        // Live mirrors never hold this gate; do not reacquire after set_live().
         drop(subscribe_permit.take());
 
         let (tables_ops, n_rows) = seed;
@@ -336,12 +341,17 @@ pub async fn connect_and_mirror(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
-    // Permit should already be released after the last table's wire seed.
+    // Live invariant: permit must be gone; this session will not touch the gate
+    // again until disconnect → reconnect (which may wait disconnected).
+    debug_assert!(
+        subscribe_permit.is_none(),
+        "subscribe gate must be released before live loop"
+    );
     drop(subscribe_permit.take());
     status.set_live();
     *live_started = Some(tokio::time::Instant::now());
 
-    // Live loop — same un-split + client Ping pattern.
+    // Live loop — same un-split + client Ping pattern. No subscribe_gate.
     loop {
         tokio::select! {
             msg = sock.next() => {
@@ -380,6 +390,211 @@ where
     sock.send(Message::Ping(Bytes::new()))
         .await
         .map_err(UpstreamError::from)
+}
+
+/// Wait for a subscribe-gate permit without freezing already-subscribed tables.
+///
+/// Mid-subscribe mirrors may already have `tables_live > 0`; parking solely on
+/// `acquire` would stop applying interleaved live TUs and stall client pings.
+async fn acquire_subscribe_slot_keeping_alive<S>(
+    sock: &mut WebSocketStream<S>,
+    gate: &Arc<Semaphore>,
+    row_types: &HashMap<String, ProductType>,
+    on_update: &ApplyFn,
+    status: &MirrorStatusHandle,
+    ping_interval: &mut tokio::time::Interval,
+) -> Result<OwnedSemaphorePermit, UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let acquire = Arc::clone(gate).acquire_owned();
+    futures::pin_mut!(acquire);
+    loop {
+        tokio::select! {
+            biased;
+            permit = &mut acquire => {
+                return permit.map_err(|_| UpstreamError::Closed("subscribe gate closed".into()));
+            }
+            msg = next_binary(sock) => {
+                let msg = msg?;
+                let server = decode_server_message(&msg)?;
+                match server {
+                    ServerMessage::TransactionUpdate(_) | ServerMessage::TransactionUpdateLight(_) => {
+                        handle_live_update(server, row_types, on_update, status).await?;
+                    }
+                    ServerMessage::SubscriptionError(err) => {
+                        return Err(UpstreamError::Subscription(err.error.to_string()));
+                    }
+                    other => {
+                        log::debug!(
+                            "public-mirror: ignoring while queued for subscribe slot: {}",
+                            variant_name(&other)
+                        );
+                    }
+                }
+            }
+            _ = ping_interval.tick() => {
+                send_client_ping(sock).await?;
+            }
+        }
+    }
+}
+
+enum SubscribeWaitOutcome {
+    Seed {
+        tables_ops: Vec<UpstreamTableOps>,
+        n_rows: usize,
+        wire_bytes: usize,
+    },
+    /// Non-seed message already handled (live TU applied, ignored, or wrong query_id).
+    Handled,
+}
+
+/// Decode one binary frame received while awaiting `SubscribeMultiApplied`.
+///
+/// Large frames are decoded on the blocking pool so multi-second BSATN work
+/// cannot monopolize a shared Tokio worker (which would delay *other* mirrors
+/// that are already `live`).
+async fn decode_subscribe_wait_message<S>(
+    msg: Vec<u8>,
+    query_id: u32,
+    row_types: &HashMap<String, ProductType>,
+    sock: &mut WebSocketStream<S>,
+    on_update: &ApplyFn,
+    status: &MirrorStatusHandle,
+    ping_interval: &mut tokio::time::Interval,
+) -> Result<SubscribeWaitOutcome, UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let wire_bytes = msg.len();
+    let row_types_for_decode = row_types.clone();
+    let decode = move || -> Result<SubscribeWaitDecode, UpstreamError> {
+        let server = decode_server_message(&msg)?;
+        match server {
+            ServerMessage::SubscribeMultiApplied(sma) => {
+                if sma.query_id.id != query_id {
+                    return Ok(SubscribeWaitDecode::WrongQueryId {
+                        got: sma.query_id.id,
+                        want: query_id,
+                    });
+                }
+                let tables_ops = database_update_to_ops(&sma.update, &row_types_for_decode, /*seed*/ true)?;
+                let n_rows = tables_ops.iter().map(|t| t.inserts.len()).sum();
+                Ok(SubscribeWaitDecode::Seed {
+                    tables_ops,
+                    n_rows,
+                    wire_bytes,
+                })
+            }
+            other => Ok(SubscribeWaitDecode::Other(other)),
+        }
+    };
+
+    let decoded = if wire_bytes >= OFFLOAD_SEED_DECODE_BYTES {
+        let join = tokio::task::spawn_blocking(decode);
+        await_blocking_keeping_alive(sock, join, row_types, on_update, status, ping_interval).await?
+    } else {
+        decode()?
+    };
+
+    match decoded {
+        SubscribeWaitDecode::Seed {
+            tables_ops,
+            n_rows,
+            wire_bytes,
+        } => Ok(SubscribeWaitOutcome::Seed {
+            tables_ops,
+            n_rows,
+            wire_bytes,
+        }),
+        SubscribeWaitDecode::WrongQueryId { got, want } => {
+            log::warn!("public-mirror: unexpected SubscribeMultiApplied query_id={got} (want {want})");
+            Ok(SubscribeWaitOutcome::Handled)
+        }
+        SubscribeWaitDecode::Other(server) => {
+            match server {
+                ServerMessage::SubscriptionError(err) => {
+                    return Err(UpstreamError::Subscription(err.error.to_string()));
+                }
+                ServerMessage::TransactionUpdate(_) | ServerMessage::TransactionUpdateLight(_) => {
+                    handle_live_update(server, row_types, on_update, status).await?;
+                }
+                ServerMessage::IdentityToken(_) => {}
+                other => {
+                    log::debug!(
+                        "public-mirror: ignoring while awaiting subscribe: {}",
+                        variant_name(&other)
+                    );
+                }
+            }
+            Ok(SubscribeWaitOutcome::Handled)
+        }
+    }
+}
+
+enum SubscribeWaitDecode {
+    Seed {
+        tables_ops: Vec<UpstreamTableOps>,
+        n_rows: usize,
+        wire_bytes: usize,
+    },
+    WrongQueryId {
+        got: u32,
+        want: u32,
+    },
+    Other(ServerMessage<BsatnFormat>),
+}
+
+/// Await a `spawn_blocking` join while keeping the un-split WebSocket alive.
+async fn await_blocking_keeping_alive<S, T>(
+    sock: &mut WebSocketStream<S>,
+    join: tokio::task::JoinHandle<Result<T, UpstreamError>>,
+    row_types: &HashMap<String, ProductType>,
+    on_update: &ApplyFn,
+    status: &MirrorStatusHandle,
+    ping_interval: &mut tokio::time::Interval,
+) -> Result<T, UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: Send + 'static,
+{
+    futures::pin_mut!(join);
+    let mut queued: Vec<ServerMessage<BsatnFormat>> = Vec::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut join => {
+                break result.map_err(|e| UpstreamError::Decode(format!("seed decode join failed: {e}")))?;
+            }
+            msg = next_binary(sock) => {
+                let msg = msg?;
+                let server = decode_server_message(&msg)?;
+                match server {
+                    ServerMessage::TransactionUpdate(_) | ServerMessage::TransactionUpdateLight(_) => {
+                        queued.push(server);
+                    }
+                    ServerMessage::SubscriptionError(err) => {
+                        return Err(UpstreamError::Subscription(err.error.to_string()));
+                    }
+                    other => {
+                        log::debug!(
+                            "public-mirror: ignoring during seed decode: {}",
+                            variant_name(&other)
+                        );
+                    }
+                }
+            }
+            _ = ping_interval.tick() => {
+                send_client_ping(sock).await?;
+            }
+        }
+    };
+    let value = result?;
+    for server in queued {
+        handle_live_update(server, row_types, on_update, status).await?;
+    }
+    Ok(value)
 }
 
 /// Await a seed apply while continuing to poll the un-split WebSocket.
