@@ -691,7 +691,9 @@ fn resolve_mirror_token(args: &ArgMatches) -> anyhow::Result<Option<String>> {
 fn normalize_mirror_token(raw: &str) -> String {
     let trimmed = raw.trim();
     // Prefer an explicit JWT line inside multi-line developer-token files.
-    for line in trimmed.lines() {
+    // Split on ASCII newlines and Unicode line/paragraph separators (U+2028/U+2029),
+    // which some clipboard/export paths insert instead of `\n`.
+    for line in trimmed.split(|c: char| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')) {
         let line = line.trim();
         if line.starts_with("eyJ") {
             return line.to_string();

@@ -13,7 +13,7 @@ use spacetimedb_client_api_messages::websocket::v1::{
     UpdateStatus,
 };
 use spacetimedb_lib::{bsatn, ConnectionId, Identity, ProductValue, Timestamp};
-use spacetimedb_sats::ProductType;
+use spacetimedb_sats::{ProductType, WithTypespace};
 use spacetimedb_schema::def::ModuleDef;
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -303,13 +303,19 @@ fn handle_live_update(
 
 fn build_row_types(module_def: &ModuleDef) -> Result<HashMap<String, ProductType>, UpstreamError> {
     let mut map = HashMap::new();
+    let typespace = module_def.typespace();
     for table in module_def.tables() {
         let name = table.name.to_string();
-        let alg = module_def
-            .typespace()
+        let alg = typespace
             .get(table.product_type_ref)
             .ok_or_else(|| UpstreamError::UnknownTable(name.clone()))?;
-        let product = alg
+        // Inline AlgebraicType::Ref… so ProductValue::decode (empty typespace) works.
+        // BitCraft row types nest refs (e.g. timestamps / enums); leaving them unresolved
+        // panics on the first live delete with "len is 0 but the index is N".
+        let resolved = WithTypespace::new(typespace, alg).resolve_refs().map_err(|e| {
+            UpstreamError::Decode(format!("resolve row type for {name}: {e}"))
+        })?;
+        let product = resolved
             .as_product()
             .ok_or_else(|| UpstreamError::NotProduct(name.clone()))?
             .clone();
