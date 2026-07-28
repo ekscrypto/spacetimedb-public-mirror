@@ -103,7 +103,11 @@ While `subscribing`, the response also includes the current table name/phase,
 socket bytes received since that subscribe started, and `last_byte_at` so you
 can tell a slowly arriving seed from a hung connection. During `applying_seed`,
 `current_table_seed_rows_applied` / `last_seed_apply_at` tick as rows are
-inserted locally. Large full-table seeds (e.g. `location_state`) are kept: the
+inserted locally. Seed applies are **idempotent**: each table is truncated in
+the same transaction before its snapshot rows are inserted, so a reconnect
+re-seed converges instead of crash-looping on unique-constraint violations
+against rows left over from the previous session (downstream subscribers only
+see the net diff). Large full-table seeds (e.g. `location_state`) are kept: the
 upstream client leaves tungstenite message/frame caps unlimited, never splits
 the WebSocket (so auto-Pongs flush mid-reassembly), and keeps client Pings
 flowing during seed wait and apply.

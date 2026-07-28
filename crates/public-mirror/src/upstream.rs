@@ -88,6 +88,10 @@ pub struct UpstreamUpdate {
     /// `None` for subscribe-applied seed rows; `Some` for committed transaction updates.
     pub provenance: Option<UpstreamProvenance>,
     pub tables: Vec<UpstreamTableOps>,
+    /// `true` for a `SubscribeMultiApplied` snapshot: the local table is cleared
+    /// before inserting so reconnect re-seeds converge instead of hitting unique
+    /// constraint violations on rows left over from the previous session.
+    pub is_seed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -317,9 +321,18 @@ pub async fn connect_and_mirror(
         // Live mirrors never hold this gate; do not reacquire after set_live().
         drop(subscribe_permit.take());
 
-        let (tables_ops, n_rows) = seed;
+        let (mut tables_ops, n_rows) = seed;
+        // An empty seed must still clear the local table: after a reconnect the
+        // previous session's rows may be stale (upstream table now empty).
+        if tables_ops.is_empty() {
+            tables_ops.push(UpstreamTableOps {
+                table_name: table.clone(),
+                deletes: Vec::new(),
+                inserts: Vec::new(),
+            });
+        }
         let progress = status.set_applying_seed(n_rows as u64);
-        if !tables_ops.is_empty() {
+        {
             // Apply can take a long time for huge seeds. Keep reading + pinging
             // so the upstream ping timeout does not RST mid-apply; queue any
             // interleaved live TUs until the seed commit finishes.
@@ -327,6 +340,7 @@ pub async fn connect_and_mirror(
                 UpstreamUpdate {
                     provenance: None,
                     tables: tables_ops,
+                    is_seed: true,
                 },
                 Some(progress),
             );
@@ -673,9 +687,16 @@ async fn handle_live_update(
             if tables.is_empty() {
                 return Ok(());
             }
-            on_update(UpstreamUpdate { provenance, tables }, None)
-                .await
-                .map_err(|e| UpstreamError::Decode(format!("apply update failed: {e:#}")))?;
+            on_update(
+                UpstreamUpdate {
+                    provenance,
+                    tables,
+                    is_seed: false,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| UpstreamError::Decode(format!("apply update failed: {e:#}")))?;
             status.inc_transactions();
         }
         ServerMessage::TransactionUpdateLight(tul) => {
@@ -687,6 +708,7 @@ async fn handle_live_update(
                 UpstreamUpdate {
                     provenance: None,
                     tables,
+                    is_seed: false,
                 },
                 None,
             )

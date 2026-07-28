@@ -114,6 +114,7 @@ pub async fn run_public_mirror_loop(
             let module_host = module_host.clone();
             let table_ids = table_ids.clone();
             async move {
+                let is_seed = update.is_seed;
                 let (provenance, ops) = update_to_table_ops(update, &table_ids)?;
                 if ops.is_empty() {
                     return Ok(());
@@ -123,7 +124,7 @@ pub async fn run_public_mirror_loop(
                     last_apply_unix_ms: p.last_apply_unix_ms,
                 });
                 module_host
-                    .apply_mirrored_update(provenance, ops, progress)
+                    .apply_mirrored_update(provenance, ops, progress, is_seed)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(())

@@ -61,11 +61,16 @@ impl SeedApplyProgress {
 }
 
 /// Apply row ops in one mut tx and broadcast with upstream provenance.
+///
+/// When `is_seed` is set, each table is cleared before its snapshot rows are
+/// inserted. Reconnect re-seeds otherwise collide with rows left over from the
+/// previous session (unique constraint violation → endless reconnect loop).
 pub fn apply_external_update(
     subs: &ModuleSubscriptions,
     provenance: Option<ExternalProvenance>,
     ops: impl IntoIterator<Item = TableOps>,
     progress: Option<SeedApplyProgress>,
+    is_seed: bool,
 ) -> Result<(), DBError> {
     let stdb = subs.relational_db();
     let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
@@ -80,6 +85,18 @@ pub fn apply_external_update(
     let mut since_tick = 0u64;
 
     for table_ops in ops {
+        if is_seed {
+            // Truncate-then-insert makes re-seeds idempotent. In the same mut-tx,
+            // unchanged rows cancel out (delete + identical insert), so downstream
+            // subscribers only see the actual diff against the previous session.
+            let removed = tx.clear_table(table_ops.table_id)?;
+            if removed > 0 {
+                log::info!(
+                    "public-mirror: cleared {removed} stale rows from table {} before re-seed",
+                    table_ops.table_id
+                );
+            }
+        }
         for row in &table_ops.deletes {
             tx.delete_product_value(table_ops.table_id, row)?;
             total_applied += 1;

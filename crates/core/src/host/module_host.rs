@@ -1860,6 +1860,7 @@ impl ModuleHost {
         provenance: Option<super::public_mirror::ExternalProvenance>,
         ops: Vec<super::public_mirror::TableOps>,
         progress: Option<super::public_mirror::SeedApplyProgress>,
+        is_seed: bool,
     ) -> Result<(), DBError> {
         self.guard_closed()
             .map_err(|_| DBError::Other(anyhow::anyhow!("module closed")))?;
@@ -1872,7 +1873,7 @@ impl ModuleHost {
         let subs = self.subscriptions().clone();
         executor
             .run_sync_job(move |_| {
-                super::public_mirror::apply_external_update(&subs, provenance, ops, progress)
+                super::public_mirror::apply_external_update(&subs, provenance, ops, progress, is_seed)
             })
             .await
     }
