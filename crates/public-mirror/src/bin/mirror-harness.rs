@@ -59,6 +59,10 @@ struct Args {
     /// How long to collect updates (seconds).
     #[arg(long, default_value_t = 30)]
     seconds: u64,
+
+    /// Only connect to the local mirror (skip upstream comparison). Useful to dump reducer provenance.
+    #[arg(long, default_value_t = false)]
+    mirror_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -112,6 +116,38 @@ async fn main() -> anyhow::Result<()> {
     let upstream = Arc::new(Mutex::new(Collector::default()));
     let mirror = Arc::new(Mutex::new(Collector::default()));
 
+    if args.mirror_only {
+        let collector = mirror.clone();
+        let tables = args.tables.clone();
+        let secs = args.seconds;
+        run_client("mirror", mirror_host, &mirror_db, None, &tables, collector, secs).await?;
+
+        let mir = mirror.lock().unwrap();
+        println!("=== mirror-only provenance dump ===");
+        println!("mirror TUs: {}", mir.tu_count);
+        let mut samples: Vec<_> = mir.tus.keys().collect();
+        samples.sort_by(|a, b| a.reducer_name.cmp(&b.reducer_name));
+        println!("reducer provenance samples (up to 20):");
+        for key in samples.into_iter().take(20) {
+            let s = &mir.tus[key];
+            println!(
+                "  reducer={} request_id={} caller={} (+{}/-{})",
+                key.reducer_name, key.request_id, key.caller, s.insert_rows, s.delete_rows
+            );
+        }
+        if mir.tu_count == 0 {
+            anyhow::bail!("no TransactionUpdates observed on mirror in {}s", args.seconds);
+        }
+        // Confirm non-empty reducer names (not anonymous / light updates only).
+        let named = mir.tus.keys().filter(|k| !k.reducer_name.is_empty()).count();
+        println!("named_reducers={named} distinct_keys={}", mir.tus.len());
+        if named == 0 {
+            anyhow::bail!("TransactionUpdates lacked reducer_name provenance");
+        }
+        println!("PASS (local mirror exposes reducer provenance)");
+        return Ok(());
+    }
+
     let up_task = {
         let collector = upstream.clone();
         let tables = args.tables.clone();
@@ -144,6 +180,18 @@ async fn main() -> anyhow::Result<()> {
     println!("=== mirror-harness summary ===");
     println!("upstream TUs: {}", up.tu_count);
     println!("mirror   TUs: {}", mir.tu_count);
+
+    // Show that local clients receive upstream reducer provenance on the mirror.
+    let mut samples: Vec<_> = mir.tus.keys().collect();
+    samples.sort_by(|a, b| a.reducer_name.cmp(&b.reducer_name));
+    println!("mirror reducer provenance samples (up to 12):");
+    for key in samples.into_iter().take(12) {
+        let s = &mir.tus[key];
+        println!(
+            "  reducer={} request_id={} caller={} (+{}/-{})",
+            key.reducer_name, key.request_id, key.caller, s.insert_rows, s.delete_rows
+        );
+    }
 
     let mut matched = 0usize;
     let mut mismatched = 0usize;
