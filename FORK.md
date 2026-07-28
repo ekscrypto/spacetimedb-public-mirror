@@ -79,20 +79,25 @@ Clients connect to the local mirror by database name (`bitcraft-live-1`,
 `bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
 Initial connect/subscribe is gated by `--mirror-subscribe-concurrency` (default
-**1**): only that many mirrors may seed at once. A slot is released when a mirror
-reaches `live`, so others queue as `waiting` rather than flooding upstream with
-concurrent large-shard seeds (which tend to stall around the same heavy tables).
-Raise the concurrency only if you have evidence the upstream can absorb it.
+**1**): only that many mirrors may hold a **wire-seed** slot at once (connect +
+awaiting each table's `SubscribeMultiApplied`). The slot is **released before
+local seed apply**, so a multi-minute `location_state` insert cannot park every
+other mirror in `waiting`. Reconnecting mirrors may show `current_table_phase:
+queued` while they wait for the next free wire slot; `tables_live` is preserved.
+Raise the concurrency only if you have evidence the upstream can absorb concurrent
+large-shard wire seeds.
 
 Per-mirror connectivity (waiting / connecting / subscribing / live / disconnected),
 table sync progress, transaction counts, and reconnect ETA are exposed at
 `GET /v1/mirrors` (JSON, unauthenticated — same posture as `/v1/metrics`).
 While `subscribing`, the response also includes the current table name/phase,
 socket bytes received since that subscribe started, and `last_byte_at` so you
-can tell a slowly arriving seed from a hung connection. Large full-table seeds
-(e.g. `location_state`) are kept: the upstream client leaves tungstenite
-message/frame caps unlimited, never splits the WebSocket (so auto-Pongs flush
-mid-reassembly), and keeps client Pings flowing during seed wait and apply.
+can tell a slowly arriving seed from a hung connection. During `applying_seed`,
+`current_table_seed_rows_applied` / `last_seed_apply_at` tick as rows are
+inserted locally. Large full-table seeds (e.g. `location_state`) are kept: the
+upstream client leaves tungstenite message/frame caps unlimited, never splits
+the WebSocket (so auto-Pongs flush mid-reassembly), and keeps client Pings
+flowing during seed wait and apply.
 
 ### Compatibility harness
 

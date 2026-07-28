@@ -76,6 +76,10 @@ struct MirrorStatusInner {
     /// Bytes_total snapshot when the current table subscribe was sent.
     current_table_bytes_baseline: u64,
     current_table_seed_rows: Option<u64>,
+    /// Rows inserted so far during `applying_seed` (shared with the sync apply job).
+    current_table_seed_rows_applied: Option<Arc<AtomicU64>>,
+    /// Unix millis of last seed-insert progress tick.
+    last_seed_apply_unix_ms: Option<Arc<AtomicU64>>,
     byte_counter: Option<ByteCounter>,
 }
 
@@ -86,6 +90,8 @@ impl MirrorStatusInner {
         self.current_table_phase = None;
         self.current_table_bytes_baseline = 0;
         self.current_table_seed_rows = None;
+        self.current_table_seed_rows_applied = None;
+        self.last_seed_apply_unix_ms = None;
     }
 
     fn snapshot(&self, now: SystemTime) -> MirrorStatusSnapshot {
@@ -121,6 +127,19 @@ impl MirrorStatusInner {
             (None, None)
         };
 
+        let current_table_seed_rows_applied = self
+            .current_table_seed_rows_applied
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed));
+        let last_seed_apply_at = self.last_seed_apply_unix_ms.as_ref().and_then(|c| {
+            let ms = c.load(Ordering::Relaxed);
+            if ms == 0 {
+                None
+            } else {
+                Some(format_rfc3339(UNIX_EPOCH + Duration::from_millis(ms)))
+            }
+        });
+
         MirrorStatusSnapshot {
             host: self.host.clone(),
             database: self.database.clone(),
@@ -138,6 +157,8 @@ impl MirrorStatusInner {
             current_table_bytes_received,
             last_byte_at,
             current_table_seed_rows: self.current_table_seed_rows,
+            current_table_seed_rows_applied,
+            last_seed_apply_at,
         }
     }
 }
@@ -171,6 +192,8 @@ impl MirrorStatusRegistry {
             current_table_phase: None,
             current_table_bytes_baseline: 0,
             current_table_seed_rows: None,
+            current_table_seed_rows_applied: None,
+            last_seed_apply_unix_ms: None,
             byte_counter: None,
         }));
         self.mirrors
@@ -190,6 +213,25 @@ impl MirrorStatusRegistry {
             .map(|m| m.lock().expect("mirror status poisoned").snapshot(now))
             .collect();
         MirrorsResponse { mirrors }
+    }
+}
+
+/// Progress counters for one seed apply (shared with the sync insert job).
+#[derive(Debug, Clone)]
+pub struct SeedApplyProgress {
+    pub rows_applied: Arc<AtomicU64>,
+    pub last_apply_unix_ms: Arc<AtomicU64>,
+}
+
+impl SeedApplyProgress {
+    /// Record that `total_applied` rows have been inserted so far.
+    pub fn record(&self, total_applied: u64) {
+        self.rows_applied.store(total_applied, Ordering::Relaxed);
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+        self.last_apply_unix_ms.store(ms, Ordering::Relaxed);
     }
 }
 
@@ -247,6 +289,18 @@ impl MirrorStatusHandle {
         });
     }
 
+    /// Connected but waiting for a subscribe-gate slot before the next table seed.
+    /// Preserves `tables_live` (unlike [`Self::set_waiting`]).
+    pub fn set_queued_for_subscribe_slot(&self) {
+        self.with_mut(|s| {
+            s.connectivity = MirrorConnectivity::Subscribing;
+            s.disconnected_since = None;
+            s.next_attempt_at = None;
+            s.clear_current_table();
+            s.current_table_phase = Some(SubscribePhase::Queued);
+        });
+    }
+
     /// Begin awaiting seed for `table` (baselines byte counter).
     pub fn set_subscribing_table(&self, table: impl Into<String>) {
         self.with_mut(|s| {
@@ -259,16 +313,31 @@ impl MirrorStatusHandle {
             s.current_table_phase = Some(SubscribePhase::AwaitingSeed);
             s.current_table_bytes_baseline = baseline;
             s.current_table_seed_rows = None;
+            s.current_table_seed_rows_applied = None;
+            s.last_seed_apply_unix_ms = None;
         });
     }
 
     /// Seed message decoded; applying into the local DB.
-    pub fn set_applying_seed(&self, seed_rows: u64) {
+    /// Caller should have released the subscribe gate before this — local apply
+    /// must not block other mirrors from reconnecting.
+    ///
+    /// Returns shared counters the apply job updates so `/v1/mirrors` can show
+    /// insert progress on huge tables.
+    pub fn set_applying_seed(&self, seed_rows: u64) -> SeedApplyProgress {
+        let rows_applied = Arc::new(AtomicU64::new(0));
+        let last_apply_unix_ms = Arc::new(AtomicU64::new(0));
         self.with_mut(|s| {
             s.connectivity = MirrorConnectivity::Subscribing;
             s.current_table_phase = Some(SubscribePhase::ApplyingSeed);
             s.current_table_seed_rows = Some(seed_rows);
+            s.current_table_seed_rows_applied = Some(Arc::clone(&rows_applied));
+            s.last_seed_apply_unix_ms = Some(Arc::clone(&last_apply_unix_ms));
         });
+        SeedApplyProgress {
+            rows_applied,
+            last_apply_unix_ms,
+        }
     }
 
     /// `tables_live` tables have completed SubscribeMultiApplied (1..=tables_total).
@@ -489,6 +558,7 @@ mod tests {
         let m = &reg.snapshot().mirrors[0];
         assert_eq!(m.current_table_phase, Some(SubscribePhase::ApplyingSeed));
         assert_eq!(m.current_table_seed_rows, Some(42_000));
+        assert_eq!(m.current_table_seed_rows_applied, Some(0));
         // Bytes keep reporting while applying.
         assert_eq!(m.current_table_bytes_received, Some(1500));
 
@@ -497,9 +567,18 @@ mod tests {
         assert_eq!(m.tables_live, 1);
         assert!(m.current_table.is_none());
         assert!(m.current_table_bytes_received.is_none());
+        assert!(m.current_table_seed_rows_applied.is_none());
+
+        // Mid-subscribe queue for the next wire slot must preserve tables_live.
+        h.set_queued_for_subscribe_slot();
+        let m = &reg.snapshot().mirrors[0];
+        assert_eq!(m.connectivity, MirrorConnectivity::Subscribing);
+        assert_eq!(m.current_table_phase, Some(SubscribePhase::Queued));
+        assert_eq!(m.tables_live, 1);
+        assert!(m.current_table.is_none());
 
         let json = serde_json::to_value(reg.snapshot()).unwrap();
-        // After clear, progress fields are omitted.
         assert!(json["mirrors"][0].get("current_table").is_none());
+        assert_eq!(json["mirrors"][0]["current_table_phase"], "queued");
     }
 }

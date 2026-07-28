@@ -21,7 +21,9 @@ use spacetimedb_primitives::TableId;
 use spacetimedb_schema::def::ModuleDef;
 use spacetimedb_schema::identifier::Identifier;
 use spacetimedb_schema::reducer_name::ReducerName;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Upstream reducer call-stack / provenance to attach to a mirrored update.
 pub struct ExternalProvenance {
@@ -40,22 +42,69 @@ pub struct TableOps {
     pub inserts: Vec<Bytes>, // BSATN row bytes for `RelationalDB::insert`
 }
 
+/// Shared counters updated during a large seed insert (for `/v1/mirrors`).
+#[derive(Clone)]
+pub struct SeedApplyProgress {
+    pub rows_applied: Arc<AtomicU64>,
+    pub last_apply_unix_ms: Arc<AtomicU64>,
+}
+
+impl SeedApplyProgress {
+    fn record(&self, total_applied: u64) {
+        self.rows_applied.store(total_applied, Ordering::Relaxed);
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+        self.last_apply_unix_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
 /// Apply row ops in one mut tx and broadcast with upstream provenance.
 pub fn apply_external_update(
     subs: &ModuleSubscriptions,
     provenance: Option<ExternalProvenance>,
     ops: impl IntoIterator<Item = TableOps>,
+    progress: Option<SeedApplyProgress>,
 ) -> Result<(), DBError> {
     let stdb = subs.relational_db();
     let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
 
+    // Yield / report periodically so a multi-million-row seed insert cannot
+    // starve other mirrors' WebSocket ping/pong tasks, and so `/v1/mirrors`
+    // can show forward progress during `applying_seed`.
+    const PROGRESS_EVERY: u64 = 50_000;
+    let mut total_applied = 0u64;
+    let mut since_tick = 0u64;
+
     for table_ops in ops {
         for row in &table_ops.deletes {
             tx.delete_product_value(table_ops.table_id, row)?;
+            total_applied += 1;
+            since_tick += 1;
+            if since_tick >= PROGRESS_EVERY {
+                if let Some(p) = &progress {
+                    p.record(total_applied);
+                }
+                std::thread::yield_now();
+                since_tick = 0;
+            }
         }
         for row_bytes in &table_ops.inserts {
             stdb.insert(&mut tx, table_ops.table_id, row_bytes)?;
+            total_applied += 1;
+            since_tick += 1;
+            if since_tick >= PROGRESS_EVERY {
+                if let Some(p) = &progress {
+                    p.record(total_applied);
+                }
+                std::thread::yield_now();
+                since_tick = 0;
+            }
         }
+    }
+    if let Some(p) = &progress {
+        p.record(total_applied);
     }
 
     let (timestamp, caller_identity, caller_connection_id, request_id, function_call) = match provenance {

@@ -162,10 +162,11 @@ pub fn cli() -> clap::Command {
             Arg::new("mirror_subscribe_concurrency")
                 .long("mirror-subscribe-concurrency")
                 .help(
-                    "Max number of mirrors that may connect/subscribe at once (default: 1). \
-                     A slot is held only until that mirror reaches live; concurrent live \
-                     mirrors are fine. Raise cautiously — concurrent large-shard seeds \
-                     tend to stall around the same heavy tables.",
+                    "Max number of mirrors that may hold a wire-seed slot at once (default: 1). \
+                     A slot is held during connect and while awaiting each table's \
+                     SubscribeMultiApplied, then released before local seed apply so a \
+                     long insert cannot block reconnects. Concurrent live mirrors are fine. \
+                     Raise cautiously — concurrent large-shard wire seeds tend to stall.",
                 )
                 .requires("public_mirror_v1")
                 .value_parser(clap::value_parser!(usize))
@@ -334,7 +335,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
         let subscribe_gate = Arc::new(tokio::sync::Semaphore::new(mirror_subscribe_concurrency));
         log::info!(
             "public-mirror: subscribe concurrency gate = {mirror_subscribe_concurrency} \
-             (mirrors seed one slot at a time until live)"
+             (slot held for wire seed only; released before local apply)"
         );
         for m in &mirrors {
             bootstrap_public_mirror(

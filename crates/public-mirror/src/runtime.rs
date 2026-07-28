@@ -80,9 +80,8 @@ fn update_to_table_ops(
 /// Each apply is scheduled onto the mirror's dedicated [`spacetimedb::util::jobs::SingleThreadedExecutor`]
 /// via [`ModuleHost::apply_mirrored_update`], matching SpacetimeDB's one-thread-per-database model.
 ///
-/// `subscribe_gate` serialises the connect/subscribe flood across mirrors in this process
-/// (same role as the relay-coordinator reconnect permit). The permit is held only until the
-/// mirror reaches `live`; concurrent live mirrors are fine.
+/// `subscribe_gate` serialises concurrent **wire** seeds (and initial connect) across mirrors.
+/// The permit is released before each local seed apply so a long insert cannot block reconnects.
 pub async fn run_public_mirror_loop(
     module_host: ModuleHost,
     config: PublicMirrorConfig,
@@ -108,22 +107,30 @@ pub async fn run_public_mirror_loop(
     let stdb = module_host.relational_db().clone();
     let table_ids = resolve_table_ids(&stdb, &tables)?;
 
-    let on_update = Arc::new(move |update: UpstreamUpdate| -> BoxFuture<'static, Result<(), anyhow::Error>> {
-        let module_host = module_host.clone();
-        let table_ids = table_ids.clone();
-        async move {
-            let (provenance, ops) = update_to_table_ops(update, &table_ids)?;
-            if ops.is_empty() {
-                return Ok(());
+    let on_update = Arc::new(
+        move |update: UpstreamUpdate,
+              progress: Option<crate::status::SeedApplyProgress>|
+              -> BoxFuture<'static, Result<(), anyhow::Error>> {
+            let module_host = module_host.clone();
+            let table_ids = table_ids.clone();
+            async move {
+                let (provenance, ops) = update_to_table_ops(update, &table_ids)?;
+                if ops.is_empty() {
+                    return Ok(());
+                }
+                let progress = progress.map(|p| spacetimedb::host::public_mirror::SeedApplyProgress {
+                    rows_applied: p.rows_applied,
+                    last_apply_unix_ms: p.last_apply_unix_ms,
+                });
+                module_host
+                    .apply_mirrored_update(provenance, ops, progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok(())
             }
-            module_host
-                .apply_mirrored_update(provenance, ops)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok(())
-        }
-        .boxed()
-    });
+            .boxed()
+        },
+    );
 
     let upstream_cfg = UpstreamConfig {
         host: config.upstream,
@@ -150,6 +157,7 @@ pub async fn run_public_mirror_loop(
             on_update.clone(),
             &mut live_started,
             status.clone(),
+            Arc::clone(&subscribe_gate),
             Some(permit),
         )
         .await;

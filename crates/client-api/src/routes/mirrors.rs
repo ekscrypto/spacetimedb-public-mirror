@@ -21,9 +21,14 @@ pub enum MirrorConnectivity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscribePhase {
+    /// Connected, but parked on the subscribe gate before the next table's wire seed.
+    /// Does not clear `tables_live` — used so a long local apply on another mirror
+    /// cannot block reconnects for the whole remaining table list.
+    Queued,
     /// Waiting for `SubscribeMultiApplied` (seed may still be arriving on the wire).
     AwaitingSeed,
     /// Seed message received; applying rows into the local mirror DB.
+    /// The subscribe gate is released during this phase so other mirrors can reconnect.
     ApplyingSeed,
 }
 
@@ -58,6 +63,12 @@ pub struct MirrorStatusSnapshot {
     /// Row count from `SubscribeMultiApplied`, set while `applying_seed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_table_seed_rows: Option<u64>,
+    /// Inserts committed into the local mut-tx so far (ticks during `applying_seed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table_seed_rows_applied: Option<u64>,
+    /// Wall clock of the last seed-insert progress tick (hang detector during apply).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seed_apply_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

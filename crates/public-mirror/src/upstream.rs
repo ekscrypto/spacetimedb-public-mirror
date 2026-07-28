@@ -19,7 +19,7 @@ use spacetimedb_schema::def::ModuleDef;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{client_async_tls_with_config, WebSocketStream};
@@ -115,7 +115,14 @@ pub enum UpstreamError {
     Closed(String),
 }
 
-type ApplyFn = Arc<dyn Fn(UpstreamUpdate) -> BoxFuture<'static, Result<(), anyhow::Error>> + Send + Sync>;
+type ApplyFn = Arc<
+    dyn Fn(
+            UpstreamUpdate,
+            Option<crate::status::SeedApplyProgress>,
+        ) -> BoxFuture<'static, Result<(), anyhow::Error>>
+        + Send
+        + Sync,
+>;
 
 /// Connect to upstream v1, sequentially subscribe to each table, apply seeds and live updates.
 ///
@@ -123,9 +130,10 @@ type ApplyFn = Arc<dyn Fn(UpstreamUpdate) -> BoxFuture<'static, Result<(), anyho
 /// caller can measure how long the session was actually live (for reconnect backoff).
 /// It is left `None` if connect/subscribe fails before the live loop.
 ///
-/// `subscribe_permit`, when present, is dropped as soon as all tables are subscribed
-/// (entering live) so another mirror can begin its seed. On connect/subscribe failure
-/// the permit is dropped by RAII when this function returns.
+/// `subscribe_gate` limits concurrent **wire** seeds (and the initial connect). The permit
+/// is released before each local seed apply so a multi-minute `location_state` insert
+/// cannot block other mirrors from reconnecting. On failure the held permit (if any)
+/// is dropped by RAII when this function returns.
 pub async fn connect_and_mirror(
     config: UpstreamConfig,
     module_def: &ModuleDef,
@@ -133,6 +141,7 @@ pub async fn connect_and_mirror(
     on_update: ApplyFn,
     live_started: &mut Option<tokio::time::Instant>,
     status: MirrorStatusHandle,
+    subscribe_gate: Arc<Semaphore>,
     mut subscribe_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
@@ -216,6 +225,28 @@ pub async fn connect_and_mirror(
     }
 
     for (idx, table) in tables.iter().enumerate() {
+        // Hold the gate only for the wire seed. Release before local apply so a
+        // multi-minute insert cannot park every reconnecting mirror behind us.
+        if subscribe_permit.is_none() {
+            if subscribe_gate.available_permits() == 0 {
+                log::info!(
+                    "public-mirror: `{}` queued for subscribe slot before [{}/{}] {table} \
+                     ({} tables already live)",
+                    config.database,
+                    idx + 1,
+                    tables.len(),
+                    idx
+                );
+                status.set_queued_for_subscribe_slot();
+            }
+            subscribe_permit = Some(
+                Arc::clone(&subscribe_gate)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| UpstreamError::Closed("subscribe gate closed".into()))?,
+            );
+        }
+
         let request_id = (idx as u32).saturating_add(1);
         let query_id = request_id;
         let query = format!("SELECT * FROM {table}");
@@ -278,16 +309,22 @@ pub async fn connect_and_mirror(
             }
         };
 
+        // Free the slot before local apply — reconnecting mirrors can proceed.
+        drop(subscribe_permit.take());
+
         let (tables_ops, n_rows) = seed;
-        status.set_applying_seed(n_rows as u64);
+        let progress = status.set_applying_seed(n_rows as u64);
         if !tables_ops.is_empty() {
             // Apply can take a long time for huge seeds. Keep reading + pinging
             // so the upstream ping timeout does not RST mid-apply; queue any
             // interleaved live TUs until the seed commit finishes.
-            let apply = on_update(UpstreamUpdate {
-                provenance: None,
-                tables: tables_ops,
-            });
+            let apply = on_update(
+                UpstreamUpdate {
+                    provenance: None,
+                    tables: tables_ops,
+                },
+                Some(progress),
+            );
             apply_seed_keeping_alive(&mut sock, apply, &row_types, &on_update, &status, &mut ping_interval)
                 .await
                 .map_err(|e| UpstreamError::Decode(format!("apply seed failed: {e:#}")))?;
@@ -299,7 +336,7 @@ pub async fn connect_and_mirror(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
-    // Release the subscribe gate so the next queued mirror can start seeding.
+    // Permit should already be released after the last table's wire seed.
     drop(subscribe_permit.take());
     status.set_live();
     *live_started = Some(tokio::time::Instant::now());
@@ -421,7 +458,7 @@ async fn handle_live_update(
             if tables.is_empty() {
                 return Ok(());
             }
-            on_update(UpstreamUpdate { provenance, tables })
+            on_update(UpstreamUpdate { provenance, tables }, None)
                 .await
                 .map_err(|e| UpstreamError::Decode(format!("apply update failed: {e:#}")))?;
             status.inc_transactions();
@@ -431,10 +468,13 @@ async fn handle_live_update(
             if tables.is_empty() {
                 return Ok(());
             }
-            on_update(UpstreamUpdate {
-                provenance: None,
-                tables,
-            })
+            on_update(
+                UpstreamUpdate {
+                    provenance: None,
+                    tables,
+                },
+                None,
+            )
             .await
             .map_err(|e| UpstreamError::Decode(format!("apply light update failed: {e:#}")))?;
         }
