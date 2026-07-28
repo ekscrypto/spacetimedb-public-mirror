@@ -233,6 +233,15 @@ pub struct ModuleInfo {
     pub subscriptions: ModuleSubscriptions,
     /// Metrics handles for this module.
     pub metrics: ModuleMetrics,
+    /// When `Some`, this host is a public-mirror-v1 read-only mirror.
+    pub mirror_policy: Option<MirrorPolicy>,
+}
+
+/// Policy for a public-mirror-v1 host.
+#[derive(Debug, Clone)]
+pub struct MirrorPolicy {
+    /// When true, OneOffQuery is rejected. CallReducer is always rejected when mirror_policy is Some.
+    pub reject_one_off_query: bool,
 }
 
 impl fmt::Debug for ModuleInfo {
@@ -257,7 +266,7 @@ pub struct ModuleMetrics {
 }
 
 impl ModuleMetrics {
-    fn new(db: &Identity) -> Self {
+    pub(crate) fn new(db: &Identity) -> Self {
         let connected_clients = WORKER_METRICS.connected_clients.with_label_values(db);
         let ws_clients_spawned = WORKER_METRICS.ws_clients_spawned.with_label_values(db);
         let ws_clients_aborted = WORKER_METRICS.ws_clients_aborted.with_label_values(db);
@@ -301,6 +310,32 @@ impl ModuleInfo {
             module_hash,
             subscriptions,
             metrics,
+            mirror_policy: None,
+        })
+    }
+
+    pub fn is_public_mirror(&self) -> bool {
+        self.mirror_policy.is_some()
+    }
+
+    /// Like [`Self::new`], but marks the host as a public-mirror-v1 instance.
+    pub fn new_mirror(
+        module_def: ModuleDef,
+        owner_identity: Identity,
+        database_identity: Identity,
+        module_hash: Hash,
+        subscriptions: ModuleSubscriptions,
+        mirror_policy: MirrorPolicy,
+    ) -> Arc<Self> {
+        let metrics = ModuleMetrics::new(&database_identity);
+        Arc::new(ModuleInfo {
+            module_def: Arc::new(module_def),
+            owner_identity,
+            database_identity,
+            module_hash,
+            subscriptions,
+            metrics,
+            mirror_policy: Some(mirror_policy),
         })
     }
 
@@ -356,6 +391,12 @@ pub enum ModuleWithInstance {
 enum ModuleHostInner {
     Wasm(Box<WasmtimeModuleHost>),
     Js(Box<V8ModuleHost>),
+    Mirror(Box<MirrorModuleHost>),
+}
+
+struct MirrorModuleHost {
+    replica_ctx: Arc<ReplicaContext>,
+    scheduler: Scheduler,
 }
 
 struct CallTimerGuard {
@@ -1758,6 +1799,24 @@ impl ModuleHost {
         }
     }
 
+    /// Create a public-mirror-v1 host with no guest WASM/JS instance.
+    pub fn new_mirror(
+        info: Arc<ModuleInfo>,
+        replica_ctx: Arc<ReplicaContext>,
+        scheduler: Scheduler,
+        on_panic: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        ModuleHost {
+            info,
+            inner: Arc::new(ModuleHostInner::Mirror(Box::new(MirrorModuleHost {
+                replica_ctx,
+                scheduler,
+            }))),
+            on_panic: Arc::new(on_panic),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     #[inline]
     pub fn info(&self) -> &ModuleInfo {
         &self.info
@@ -1771,6 +1830,11 @@ impl ModuleHost {
     #[inline]
     pub fn is_js(&self) -> bool {
         matches!(&*self.inner, ModuleHostInner::Js(_))
+    }
+
+    #[inline]
+    pub fn is_public_mirror(&self) -> bool {
+        matches!(&*self.inner, ModuleHostInner::Mirror(_))
     }
 
     fn is_marked_closed(&self) -> bool {
@@ -1850,6 +1914,10 @@ impl ModuleHost {
                     .with_instance(|inst| async move { js(arg, &inst).await })
                     .await
             }
+            ModuleHostInner::Mirror(_) => {
+                drop(timer_guard);
+                return Err(NoSuchModule);
+            }
         })
     }
 
@@ -1901,6 +1969,10 @@ impl ModuleHost {
                     })
                     .await
             }
+            ModuleHostInner::Mirror(_) => {
+                drop(timer_guard);
+                return Err(NoSuchModule);
+            }
         })
     }
 
@@ -1938,6 +2010,7 @@ impl ModuleHost {
                 let on_panic = self.on_panic.clone();
                 wasm(arg, wasm_host, on_panic, timer_guard)
             }
+            ModuleHostInner::Mirror(_) => Err(NoSuchModule),
         }
     }
 
@@ -1947,6 +2020,13 @@ impl ModuleHost {
         cmd: ViewCommand,
     ) -> Result<Option<ExecutionMetrics>, DBError> {
         let metric = cmd.metric();
+
+        // public-mirror-v1 has no guest instance; run subscription ops with host: None.
+        if self.is_public_mirror() {
+            let result = self.call_view_command_for_mirror(cmd);
+            Self::record_view_command_round_trip(&self.info, metric);
+            return result;
+        }
 
         self.enqueue_main_operation(
             "websocket view operation",
@@ -1976,6 +2056,57 @@ impl ModuleHost {
         Ok(None)
     }
 
+    /// Run a v1 subscription view command without a guest module instance.
+    ///
+    /// Calls the sync `*_inner` paths directly (with `instance: None`) to avoid
+    /// async recursion through `ModuleSubscriptions::add_*` → `ModuleHost::call_view_*`.
+    fn call_view_command_for_mirror(&self, cmd: ViewCommand) -> Result<Option<ExecutionMetrics>, DBError> {
+        use crate::host::wasmtime::WasmtimeInstance;
+        let subs = self.subscriptions();
+        match cmd {
+            ViewCommand::AddSingleSubscription {
+                sender,
+                auth,
+                request,
+                _timer: timer,
+            } => subs
+                .add_single_subscription_inner::<WasmtimeInstance>(None, sender, auth, request, timer, None)
+                .map(|(metrics, _)| metrics),
+            ViewCommand::AddMultiSubscription {
+                sender,
+                auth,
+                request,
+                _timer: timer,
+            } => subs
+                .add_multi_subscription_inner::<WasmtimeInstance>(None, sender, auth, request, timer, None)
+                .map(|(metrics, _)| metrics),
+            ViewCommand::AddLegacySubscription {
+                sender,
+                auth,
+                subscribe,
+                _timer: timer,
+            } => subs
+                .add_legacy_subscriber_inner::<WasmtimeInstance>(None, sender, auth, subscribe, timer, None)
+                .map(|(metrics, _)| Some(metrics)),
+            ViewCommand::RemoveSingleSubscription {
+                sender,
+                auth,
+                request,
+                timer,
+            } => Ok(subs.remove_single_subscription(sender, auth, request, timer)?),
+            ViewCommand::RemoveMultiSubscription {
+                sender,
+                auth,
+                request,
+                timer,
+            } => Ok(subs.remove_multi_subscription(sender, auth, request, timer)?),
+            // public-mirror-v1 is intentionally v1-scoped; v2 subscriptions need a module host.
+            ViewCommand::AddSubscriptionV2 { .. } | ViewCommand::RemoveSubscriptionV2 { .. } => Err(DBError::Other(
+                anyhow::anyhow!("public-mirror-v1 does not support v2 websocket subscriptions"),
+            )),
+        }
+    }
+
     pub(in crate::host) fn record_view_command_round_trip(info: &ModuleInfo, metric: ViewCommandMetric) {
         match metric.workload {
             WorkloadType::Subscribe => info
@@ -1999,6 +2130,18 @@ impl ModuleHost {
 
     pub async fn disconnect_client(&self, client_id: ClientActorId) {
         log::trace!("disconnecting client {client_id}");
+        if self.is_public_mirror() {
+            self.info.subscriptions.remove_subscriber(client_id);
+            let stdb = self.relational_db();
+            let database_identity = stdb.database_identity();
+            if let Err(e) = stdb.with_auto_commit(Workload::Internal, |tx| {
+                tx.delete_st_client(client_id.identity, client_id.connection_id, database_identity)
+                    .map_err(DBError::from)
+            }) {
+                log::error!("Error deleting mirror client from st_client: {e}");
+            }
+            return;
+        }
         if let Err(e) = call_instance!(
             self,
             "disconnect_client",
@@ -2046,6 +2189,25 @@ impl ModuleHost {
         caller_auth: ConnectionAuthCtx,
         caller_connection_id: ConnectionId,
     ) -> Result<(), ClientConnectedError> {
+        if self.is_public_mirror() {
+            // No lifecycle reducers on a mirror; just record the client in st_client.
+            let stdb = self.relational_db();
+            let workload = Workload::reducer_no_args(
+                ReducerName::new(Identifier::new_assume_valid("call_identity_connected".into())),
+                caller_auth.claims.identity,
+                caller_connection_id,
+            );
+            return stdb
+                .with_auto_commit(workload, |tx| {
+                    tx.insert_st_client(
+                        caller_auth.claims.identity,
+                        caller_connection_id,
+                        &caller_auth.jwt_payload,
+                    )
+                    .map_err(DBError::from)
+                })
+                .map_err(|e| ClientConnectedError::DBError(e.into()));
+        }
         call_instance!(
             self,
             "call_identity_connected",
@@ -2189,6 +2351,23 @@ impl ModuleHost {
         caller_identity: Identity,
         caller_connection_id: ConnectionId,
     ) -> Result<(), ReducerCallError> {
+        if self.is_public_mirror() {
+            let stdb = self.relational_db();
+            let database_identity = stdb.database_identity();
+            let workload = Workload::reducer_no_args(
+                ReducerName::new(Identifier::new_assume_valid("__identity_disconnected__".into())),
+                caller_identity,
+                caller_connection_id,
+            );
+            let _ = stdb.with_auto_commit(workload, |tx| {
+                if tx.st_client_row(caller_identity, caller_connection_id).is_none() {
+                    return Ok(());
+                }
+                tx.delete_st_client(caller_identity, caller_connection_id, database_identity)
+                    .map_err(DBError::from)
+            });
+            return Ok(());
+        }
         call_instance!(
             self,
             "call_identity_disconnected",
@@ -2628,6 +2807,9 @@ impl ModuleHost {
                     )
                     .await;
                 Ok(())
+            }
+            ModuleHostInner::Mirror(_) => {
+                self.send_procedure_error(&procedure_name, timer, target, ProcedureCallError::NoSuchModule(NoSuchModule))
             }
         }
     }
@@ -3193,6 +3375,18 @@ impl ModuleHost {
     }
 
     async fn one_off_query_with_params(&self, request: OneOffQueryRequest) -> Result<(), anyhow::Error> {
+        // public-mirror-v1 has no guest instance; run the query inline.
+        if self.is_public_mirror() {
+            let info = self.info.clone();
+            let timer = request.timer();
+            let res = request.run();
+            if let Err(err) = &res {
+                log::warn!("mirror one-off query failed: {err:#}");
+            }
+            ModuleHost::record_one_off_query_round_trip(&info, timer);
+            return res.map(|_| ());
+        }
+
         let label = request.label();
         self.enqueue_main_operation(
             "websocket one-off query operation",
@@ -3518,6 +3712,7 @@ impl ModuleHost {
         match &*self.inner {
             ModuleHostInner::Wasm(wasm) => wasm.module.replica_ctx(),
             ModuleHostInner::Js(js) => js.module.replica_ctx(),
+            ModuleHostInner::Mirror(mirror) => &mirror.replica_ctx,
         }
     }
 
@@ -3525,6 +3720,7 @@ impl ModuleHost {
         match &*self.inner {
             ModuleHostInner::Wasm(wasm) => wasm.module.scheduler(),
             ModuleHostInner::Js(js) => js.module.scheduler(),
+            ModuleHostInner::Mirror(mirror) => &mirror.scheduler,
         }
     }
 }

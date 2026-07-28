@@ -1,4 +1,7 @@
-use super::module_host::{DurableOffset, EventStatus, InitDatabaseResult, ModuleHost, ModuleInfo, NoSuchModule};
+use super::module_host::{
+    DurableOffset, EventStatus, InitDatabaseResult, MirrorPolicy, ModuleHost, ModuleInfo, NoSuchModule,
+};
+use super::public_mirror;
 use super::scheduler::SchedulerStarter;
 use super::v8::V8HeapMetrics;
 use super::wasmtime::{WasmMemoryBytesMetric, WasmtimeRuntime};
@@ -762,6 +765,102 @@ impl HostController {
             .await
             .with_context(|| format!("failed to init replica {} for {}", replica_id, database_identity))
     }
+
+    /// Bootstrap an in-memory public-mirror-v1 host and register it under `replica_id`.
+    ///
+    /// Standalone CLI wiring should call this instead of the normal publish/launch path.
+    /// Tables are created from `module_def` without running an init reducer.
+    pub async fn bootstrap_mirror_database(
+        &self,
+        database: Database,
+        replica_id: u64,
+        module_def: ModuleDef,
+        mirror_policy: MirrorPolicy,
+    ) -> anyhow::Result<ModuleHost> {
+        anyhow::ensure!(
+            database.host_type == HostType::Mirror,
+            "bootstrap_mirror_database requires HostType::Mirror"
+        );
+
+        let Ok(mut guard) = self.acquire_write_lock(replica_id).await else {
+            bail!(
+                "unable to lock database {} for mirror bootstrap",
+                database.database_identity
+            );
+        };
+        if let Some(host) = &*guard {
+            return Ok(host.module.borrow().clone());
+        }
+
+        let (tx_metrics_queue, tx_metrics_recorder_task) = spawn_tx_metrics_recorder();
+        let (db, _connected_clients) = RelationalDB::open(
+            database.database_identity,
+            database.owner_identity,
+            EmptyHistory::new(),
+            None,
+            Some(tx_metrics_queue),
+            self.page_pool.clone(),
+        )?;
+
+        public_mirror::create_tables_from_module_def(&db, &module_def)?;
+
+        let relational_db = Arc::new(db);
+        let replica_ctx = make_replica_ctx(
+            None, // in-memory logger
+            database.clone(),
+            replica_id,
+            relational_db,
+            self.bsatn_rlb_pool.clone(),
+        )
+        .await
+        .map(Arc::new)?;
+
+        let (scheduler, scheduler_starter) = Scheduler::open(replica_ctx.relational_db().clone());
+
+        let module_hash = database.initial_program;
+        let info = ModuleInfo::new_mirror(
+            module_def,
+            database.owner_identity,
+            database.database_identity,
+            module_hash,
+            replica_ctx.subscriptions.clone(),
+            mirror_policy,
+        );
+
+        let module_host = ModuleHost::new_mirror(
+            info,
+            replica_ctx.clone(),
+            scheduler.clone(),
+            self.unregister_fn(replica_id),
+        );
+
+        scheduler_starter.start(&module_host)?;
+        let disk_metrics_recorder_task = tokio::spawn(metric_reporter(replica_ctx.clone())).abort_handle();
+        let view_cleanup_task = spawn_view_cleanup_loop(replica_ctx.relational_db().clone());
+
+        let host = Host {
+            module: watch::Sender::new(module_host.clone()),
+            replica_ctx,
+            scheduler,
+            disk_metrics_recorder_task,
+            tx_metrics_recorder_task,
+            view_cleanup_task,
+        };
+        *guard = Some(host);
+        Ok(module_host)
+    }
+
+    /// Insert a pre-built mirror [`Host`] into the controller map.
+    ///
+    /// Prefer [`Self::bootstrap_mirror_database`] unless the caller needs custom construction.
+    pub async fn insert_mirror_host(&self, replica_id: u64, host: Host) -> anyhow::Result<ModuleHost> {
+        let Ok(mut guard) = self.acquire_write_lock(replica_id).await else {
+            bail!("unable to lock replica {replica_id} for mirror host insert");
+        };
+        let module = host.module.borrow().clone();
+        *guard = Some(host);
+        Ok(module)
+    }
 }
 
 fn stored_program_hash(db: &RelationalDB) -> anyhow::Result<Option<Hash>> {
@@ -858,6 +957,7 @@ async fn make_module_host(
             let module_host = ModuleHost::new(module, unregister, database_identity);
             Ok((program, module_host))
         }
+        HostType::Mirror => bail!("cannot make_module_host for HostType::Mirror; use bootstrap_mirror_database"),
     }
 }
 
@@ -1000,7 +1100,7 @@ async fn update_module(
 }
 
 /// Encapsulates a database, associated module, and auxiliary state.
-struct Host {
+pub struct Host {
     /// The [`ModuleHost`], providing the callable reducer API.
     ///
     /// Modules may be updated via [`Host::update_module`].
@@ -1219,6 +1319,9 @@ impl Host {
                         res?
                     }
                 }
+            }
+            HostType::Mirror => {
+                bail!("HostType::Mirror must be bootstrapped via HostController::bootstrap_mirror_database")
             }
         };
 

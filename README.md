@@ -1,3 +1,8 @@
+> **Unofficial fork.** This is [`ekscrypto/spacetimedb-public-mirror`](https://github.com/ekscrypto/spacetimedb-public-mirror),
+> a public BSL fork of Clockwork Labs SpacetimeDB **v2.6.1** that adds
+> `--public-mirror-v1`. See [`FORK.md`](FORK.md). Not affiliated with Clockwork Labs;
+> not intended for upstream merge.
+
 <p align="center">
     <a href="https://spacetimedb.com#gh-dark-mode-only" target="_blank">
 	<img width="320" src="./images/dark/logo.svg" alt="SpacetimeDB Logo">

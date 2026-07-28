@@ -1,4 +1,4 @@
-mod control_db;
+pub(crate) mod control_db;
 pub mod subcommands;
 pub mod util;
 pub mod version;
@@ -123,6 +123,14 @@ impl StandaloneEnv {
 
     pub fn bsatn_rlb_pool(&self) -> &BsatnRowListBuilderPool {
         &self.host_controller.bsatn_rlb_pool
+    }
+
+    pub(crate) fn control_db(&self) -> &ControlDb {
+        &self.control_db
+    }
+
+    pub(crate) fn host_controller(&self) -> &HostController {
+        &self.host_controller
     }
 }
 

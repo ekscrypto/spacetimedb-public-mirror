@@ -1453,6 +1453,8 @@ impl ModuleKind {
     pub const WASM: ModuleKind = ModuleKind(0);
     /// The [`ModuleKind`] of JS modules.
     pub const JS: ModuleKind = ModuleKind(1);
+    /// The [`ModuleKind`] of public-mirror-v1 in-memory hosts (no guest module).
+    pub const MIRROR: ModuleKind = ModuleKind(2);
 }
 
 impl_serialize!([] ModuleKind, (self, ser) => self.0.serialize(ser));

@@ -26,6 +26,40 @@ pub(super) async fn handle_decoded_message(
     message: ws_v2::ClientMessage,
     timer: Instant,
 ) -> Result<(), MessageHandleError> {
+    // public-mirror-v1 is intentionally v1-scoped; reject mutating v2 messages.
+    let module = client.module();
+    let mod_info = module.info();
+    if mod_info.is_public_mirror() {
+        match &message {
+            ws_v2::ClientMessage::CallReducer(_) | ws_v2::ClientMessage::CallProcedure(_) => {
+                return Err(MessageExecutionError {
+                    reducer: None,
+                    reducer_id: None,
+                    caller_identity: client.id.identity,
+                    caller_connection_id: Some(client.id.connection_id),
+                    err: anyhow::anyhow!("public-mirror-v1 is read-only; CallReducer/CallProcedure are not supported"),
+                }
+                .into());
+            }
+            ws_v2::ClientMessage::OneOffQuery(_)
+                if mod_info
+                    .mirror_policy
+                    .as_ref()
+                    .is_some_and(|p| p.reject_one_off_query) =>
+            {
+                return Err(MessageExecutionError {
+                    reducer: None,
+                    reducer_id: None,
+                    caller_identity: client.id.identity,
+                    caller_connection_id: Some(client.id.connection_id),
+                    err: anyhow::anyhow!("public-mirror-v1 rejected OneOffQuery (--reject-one-off-query)"),
+                }
+                .into());
+            }
+            _ => {}
+        }
+    }
+
     type HandleResult<'a> = Result<(), (Option<&'a RawIdentifier>, Option<ReducerId>, anyhow::Error)>;
     let res: HandleResult<'_> = match message {
         ws_v2::ClientMessage::Subscribe(subscribe) => {

@@ -15,6 +15,7 @@ mod host_controller;
 mod module_common;
 #[allow(clippy::too_many_arguments)]
 pub mod module_host;
+pub mod public_mirror;
 pub mod scheduler;
 pub mod wasmtime;
 
@@ -25,12 +26,13 @@ mod wasm_common;
 
 pub use disk_storage::DiskStorage;
 pub use host_controller::{
-    extract_schema, BootstrapCompletion, CallProcedureReturn, CallResult, ExternalDurability, ExternalStorage,
+    extract_schema, BootstrapCompletion, CallProcedureReturn, CallResult, ExternalDurability, ExternalStorage, Host,
     HostController, HostRuntimeConfig, MigratePlanResult, ModuleHostWithBootstrap, ProcedureCallResult, ProgramStorage,
     ReducerCallResult, ReducerCallResultWithTxOffset, ReducerOutcome,
 };
 pub use module_host::{
-    InitDatabaseResult, ModuleHost, NoSuchModule, ProcedureCallError, ReducerCallError, UpdateDatabaseResult,
+    InitDatabaseResult, MirrorPolicy, ModuleHost, NoSuchModule, ProcedureCallError, ReducerCallError,
+    UpdateDatabaseResult,
 };
 pub use scheduler::Scheduler;
 
@@ -92,6 +94,18 @@ impl ArgsTuple {
             tuple: spacetimedb_sats::product![],
             bsatn: OnceCell::with_value(Bytes::new()),
             json: OnceCell::with_value(ByteString::from_static("[]")),
+        }
+    }
+
+    /// Prefill BSATN args without decoding into a [`ProductValue`].
+    ///
+    /// Used by public-mirror-v1 when broadcasting upstream reducer provenance:
+    /// the tuple field is unused; only the BSATN blob is sent to clients.
+    pub fn from_bsatn_unchecked(bsatn: Bytes) -> Self {
+        ArgsTuple {
+            tuple: spacetimedb_sats::product![], // unused when bsatn prefilled
+            bsatn: OnceCell::with_value(bsatn),
+            json: OnceCell::new(),
         }
     }
 

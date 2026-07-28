@@ -13,11 +13,20 @@ use clap::{Arg, ArgMatches};
 use spacetimedb::config::{parse_config, CertificateAuthority};
 use spacetimedb::db::persistence::{CommitlogConfig, DurabilityConfig};
 use spacetimedb::db::{self, Storage};
+use spacetimedb::host::MirrorPolicy;
+use spacetimedb::messages::control_db::{Database, HostType, Replica};
 use spacetimedb::startup::{self, TracingOptions};
 use spacetimedb::util::jobs::JobCores;
 use spacetimedb::worker_metrics;
+use spacetimedb::Identity;
 use spacetimedb_client_api::routes::database::DatabaseRoutes;
 use spacetimedb_client_api::routes::router;
+use spacetimedb_client_api_messages::name::DatabaseName;
+use spacetimedb_public_mirror_client::runtime::{run_public_mirror_loop, schema_program_hash, PublicMirrorConfig};
+use spacetimedb_public_mirror_client::schema::fetch_and_parse_schema;
+use std::str::FromStr;
+use std::time::Duration;
+use url::Url;
 use spacetimedb_client_api::routes::subscribe::WebSocketOptions;
 use spacetimedb_paths::cli::{PrivKeyPath, PubKeyPath};
 use spacetimedb_paths::server::{ConfigToml, ServerDataDir};
@@ -92,6 +101,62 @@ pub fn cli() -> clap::Command {
                 .action(SetTrue)
                 .help("Run in non-interactive mode (fail immediately if port is in use)"),
         )
+        .arg(
+            Arg::new("public_mirror_v1")
+                .long("public-mirror-v1")
+                .action(SetTrue)
+                .help(
+                    "Run as an in-memory public-mirror-v1 of a remote v1 BSATN database \
+                     (forces in-memory storage; rejects CallReducer)",
+                ),
+        )
+        .arg(
+            Arg::new("mirror_upstream")
+                .long("mirror-upstream")
+                .help("Upstream SpacetimeDB host URL (wss://… or https://…) for --public-mirror-v1")
+                .requires("public_mirror_v1"),
+        )
+        .arg(
+            Arg::new("mirror_database")
+                .long("mirror-database")
+                .help("Upstream database name to mirror for --public-mirror-v1")
+                .requires("public_mirror_v1"),
+        )
+        .arg(
+            Arg::new("mirror_token")
+                .long("mirror-token")
+                .help(
+                    "Bearer token for upstream auth (also BITCRAFT_TOKEN or MIRROR_TOKEN env). \
+                     Optional for --public-mirror-v1",
+                )
+                .requires("public_mirror_v1"),
+        )
+        .arg(
+            Arg::new("mirror_token_file")
+                .long("mirror-token-file")
+                .help(
+                    "Path to a file containing the upstream bearer token (also MIRROR_TOKEN_FILE env). \
+                     Multi-line files are supported: the first eyJ… JWT line is used.",
+                )
+                .requires("public_mirror_v1")
+                .value_parser(clap::value_parser!(std::path::PathBuf)),
+        )
+        .arg(
+            Arg::new("mirror_table")
+                .long("mirror-table")
+                .help(
+                    "Restrict upstream subscribe to these public tables (repeatable). \
+                     Default: all public user tables.",
+                )
+                .requires("public_mirror_v1")
+                .action(clap::ArgAction::Append),
+        )
+        .arg(
+            Arg::new("reject_one_off_query")
+                .long("reject-one-off-query")
+                .action(SetTrue)
+                .help("In public-mirror-v1 mode, also reject OneOffQuery (allowed by default)"),
+        )
     // .after_help("Run `spacetime help start` for more detailed information.")
 }
 
@@ -115,6 +180,8 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     let listen_addr = args.get_one::<String>("listen_addr").unwrap();
     let pg_port = args.get_one::<u16>("pg_port");
     let non_interactive = args.get_flag("non_interactive");
+    let public_mirror_v1 = args.get_flag("public_mirror_v1");
+    let reject_one_off_query = args.get_flag("reject_one_off_query");
     let cert_dir = args.get_one::<spacetimedb_paths::cli::ConfigDir>("jwt_key_dir");
     let certs = Option::zip(
         args.get_one::<PubKeyPath>("jwt_pub_key_path").cloned(),
@@ -126,11 +193,36 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     });
     let data_dir = args.get_one::<ServerDataDir>("data_dir").unwrap();
     let enable_tracy = args.get_flag("enable_tracy") || std::env::var_os("SPACETIMEDB_TRACY").is_some();
-    let storage = if args.get_flag("in_memory") {
+
+    let storage = if public_mirror_v1 {
+        if !args.get_flag("in_memory") {
+            log::info!("--public-mirror-v1 forces in-memory storage");
+        }
+        Storage::Memory
+    } else if args.get_flag("in_memory") {
         Storage::Memory
     } else {
         Storage::Disk
     };
+
+    let mirror_upstream = args.get_one::<String>("mirror_upstream").cloned();
+    let mirror_database = args.get_one::<String>("mirror_database").cloned();
+    let mirror_tables: Option<Vec<String>> = args
+        .get_many::<String>("mirror_table")
+        .map(|vals| vals.cloned().collect());
+    let mirror_token = resolve_mirror_token(args)?;
+
+    if public_mirror_v1 {
+        anyhow::ensure!(
+            mirror_upstream.is_some(),
+            "--public-mirror-v1 requires --mirror-upstream"
+        );
+        anyhow::ensure!(
+            mirror_database.is_some(),
+            "--public-mirror-v1 requires --mirror-database"
+        );
+    }
+
     let page_pool_max_size = args
         .get_one::<String>("page_pool_max_size")
         .map(|size| parse_size::Config::new().with_binary().parse_size(size))
@@ -148,6 +240,13 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     println!("{} version: {}", exe_name, env!("CARGO_PKG_VERSION"));
     println!("{} path: {}", exe_name, std::env::current_exe()?.display());
     println!("database running in data directory {}", data_dir.display());
+    if public_mirror_v1 {
+        println!(
+            "public-mirror-v1 mode: mirroring {} from {}",
+            mirror_database.as_deref().unwrap_or("?"),
+            mirror_upstream.as_deref().unwrap_or("?")
+        );
+    }
 
     let config_path = data_dir.config_toml();
     let config = match ConfigFile::read(&data_dir.config_toml())? {
@@ -204,6 +303,19 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     );
     worker_metrics::spawn_page_pool_stats(listen_addr.clone(), ctx.page_pool().clone());
     worker_metrics::spawn_bsatn_rlb_pool_stats(listen_addr.clone(), ctx.bsatn_rlb_pool().clone());
+
+    if public_mirror_v1 {
+        bootstrap_public_mirror(
+            &ctx,
+            mirror_upstream.as_deref().unwrap(),
+            mirror_database.as_deref().unwrap(),
+            mirror_token.as_deref(),
+            mirror_tables,
+            reject_one_off_query,
+        )
+        .await?;
+    }
+
     let mut db_routes = DatabaseRoutes::default();
     db_routes.root_post = db_routes.root_post.layer(DefaultBodyLimit::disable());
     db_routes.db_put = db_routes.db_put.layer(DefaultBodyLimit::disable());
@@ -459,6 +571,137 @@ fn prompt_yes_no(question: &str) -> bool {
     }
 
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+async fn bootstrap_public_mirror(
+    ctx: &StandaloneEnv,
+    upstream: &str,
+    mirror_database: &str,
+    token: Option<&str>,
+    tables: Option<Vec<String>>,
+    reject_one_off_query: bool,
+) -> anyhow::Result<()> {
+    let upstream_url = Url::parse(upstream).context("invalid --mirror-upstream URL")?;
+    log::info!("public-mirror: fetching schema for {mirror_database} from {upstream_url}");
+    let (schema_bytes, module_def) = fetch_and_parse_schema(&upstream_url, mirror_database)
+        .await
+        .context("failed to fetch/parse upstream schema")?;
+    log::info!(
+        "public-mirror: schema fetched ({} bytes, {} tables)",
+        schema_bytes.len(),
+        module_def.tables().count()
+    );
+
+    let database_identity = Identity::from_claims("public-mirror-v1", mirror_database);
+    let owner_identity = Identity::from_claims("public-mirror-v1", "owner");
+    let initial_program = schema_program_hash(&schema_bytes);
+
+    let database = Database {
+        id: 0,
+        database_identity,
+        owner_identity,
+        host_type: HostType::Mirror,
+        initial_program,
+    };
+
+    let control = ctx.control_db();
+    let database_id = control
+        .insert_database(database.clone())
+        .context("failed to insert mirror database into control_db")?;
+    let mut database = control
+        .get_database_by_id(database_id)?
+        .context("mirror database missing after insert")?;
+
+    // Ensure clients can connect by name.
+    let domain = DatabaseName::from_str(mirror_database)
+        .context("invalid --mirror-database name")?
+        .into();
+    match control.spacetime_insert_domain(&database_identity, domain, owner_identity, true) {
+        Ok(_) => log::info!("public-mirror: registered domain `{mirror_database}`"),
+        Err(crate::control_db::Error::RecordAlreadyExists(_)) => {
+            log::info!("public-mirror: domain `{mirror_database}` already registered");
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Insert leader replica without triggering get_or_launch (which rejects HostType::Mirror).
+    let replica_id = control.insert_replica(Replica {
+        id: 0,
+        database_id,
+        node_id: 0,
+        leader: true,
+    })?;
+    log::info!("public-mirror: control_db database_id={database_id} replica_id={replica_id}");
+
+    database.id = database_id;
+    let module_host = ctx
+        .host_controller()
+        .bootstrap_mirror_database(
+            database,
+            replica_id,
+            module_def.clone(),
+            MirrorPolicy { reject_one_off_query },
+        )
+        .await
+        .context("bootstrap_mirror_database failed")?;
+
+    let mirror_cfg = PublicMirrorConfig {
+        upstream: upstream_url,
+        database: mirror_database.to_string(),
+        auth_token: token.map(str::to_string),
+        tables,
+        connect_timeout: Duration::from_secs(60),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = run_public_mirror_loop(module_host, mirror_cfg, module_def).await {
+            log::error!("public-mirror upstream loop terminated: {e:#}");
+        }
+    });
+    log::info!("public-mirror: upstream apply loop spawned");
+    Ok(())
+}
+
+/// Resolve upstream bearer token from CLI / env / token file.
+///
+/// Multi-line files (e.g. identity hex + JWT) are supported: the first `eyJ…`
+/// line is used. A leading `Bearer ` prefix is stripped.
+fn resolve_mirror_token(args: &ArgMatches) -> anyhow::Result<Option<String>> {
+    if let Some(tok) = args.get_one::<String>("mirror_token") {
+        return Ok(Some(normalize_mirror_token(tok)));
+    }
+    if let Ok(tok) = std::env::var("BITCRAFT_TOKEN") {
+        return Ok(Some(normalize_mirror_token(&tok)));
+    }
+    if let Ok(tok) = std::env::var("MIRROR_TOKEN") {
+        return Ok(Some(normalize_mirror_token(&tok)));
+    }
+    let file = args
+        .get_one::<std::path::PathBuf>("mirror_token_file")
+        .cloned()
+        .or_else(|| std::env::var_os("MIRROR_TOKEN_FILE").map(std::path::PathBuf::from));
+    if let Some(path) = file {
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("read mirror token file {}", path.display()))?;
+        return Ok(Some(normalize_mirror_token(&contents)));
+    }
+    Ok(None)
+}
+
+fn normalize_mirror_token(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Prefer an explicit JWT line inside multi-line developer-token files.
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.starts_with("eyJ") {
+            return line.to_string();
+        }
+    }
+    let tok = trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .unwrap_or(trimmed)
+        .trim();
+    tok.to_string()
 }
 
 fn banner() {
