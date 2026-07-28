@@ -45,14 +45,22 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             request_id,
             flags,
         }) => {
-            let res = client.enqueue_reducer(reducer, args, request_id, timer, flags).await;
-            res.map_err(|e| {
-                (
+            if mod_info.is_public_mirror() {
+                Err((
                     Some(reducer),
                     mod_info.module_def.reducer_full(&**reducer).map(|(id, _)| id),
-                    e.into(),
-                )
-            })
+                    anyhow::anyhow!("public-mirror-v1 is read-only; CallReducer is not supported"),
+                ))
+            } else {
+                let res = client.enqueue_reducer(reducer, args, request_id, timer, flags).await;
+                res.map_err(|e| {
+                    (
+                        Some(reducer),
+                        mod_info.module_def.reducer_full(&**reducer).map(|(id, _)| id),
+                        e.into(),
+                    )
+                })
+            }
         }
         ws_v1::ClientMessage::SubscribeMulti(subscription) => {
             let res = client.subscribe_multi(subscription, timer).await;
@@ -78,11 +86,23 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             query_string: query,
             message_id,
         }) => {
-            let res = match client.config.protocol {
-                Protocol::Binary => client.one_off_query_bsatn(&query, &message_id, timer).await,
-                Protocol::Text => client.one_off_query_json(&query, &message_id, timer).await,
-            };
-            res.map_err(|err| (None, None, err))
+            if mod_info
+                .mirror_policy
+                .as_ref()
+                .is_some_and(|p| p.reject_one_off_query)
+            {
+                Err((
+                    None,
+                    None,
+                    anyhow::anyhow!("public-mirror-v1 rejected OneOffQuery (--reject-one-off-query)"),
+                ))
+            } else {
+                let res = match client.config.protocol {
+                    Protocol::Binary => client.one_off_query_bsatn(&query, &message_id, timer).await,
+                    Protocol::Text => client.one_off_query_json(&query, &message_id, timer).await,
+                };
+                res.map_err(|err| (None, None, err))
+            }
         }
         ws_v1::ClientMessage::CallProcedure(ws_v1::CallProcedure {
             ref procedure,
@@ -90,13 +110,21 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             request_id,
             flags: _,
         }) => {
-            let res = client.call_procedure(procedure, args, request_id, timer).await;
-            if let Err(e) = res {
-                log::warn!("Procedure call failed: {e:#}");
+            if mod_info.is_public_mirror() {
+                Err((
+                    Some(procedure),
+                    None,
+                    anyhow::anyhow!("public-mirror-v1 is read-only; CallProcedure is not supported"),
+                ))
+            } else {
+                let res = client.call_procedure(procedure, args, request_id, timer).await;
+                if let Err(e) = res {
+                    log::warn!("Procedure call failed: {e:#}");
+                }
+                // `ClientConnection::call_procedure` handles sending the error message to the client if the call fails,
+                // so we don't need to return an `Err` here.
+                Ok(())
             }
-            // `ClientConnection::call_procedure` handles sending the error message to the client if the call fails,
-            // so we don't need to return an `Err` here.
-            Ok(())
         }
     };
     res.map_err(|(reducer_name, reducer_id, err)| MessageExecutionError {

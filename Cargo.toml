@@ -24,6 +24,7 @@ members = [
   "crates/pg",
   "crates/physical-plan",
   "crates/primitives",
+  "crates/public-mirror",
   "crates/query",
   "crates/runtime",
   "crates/sats",
@@ -143,6 +144,7 @@ spacetimedb-paths = { path = "crates/paths", version = "=2.6.1" }
 spacetimedb-pg = { path = "crates/pg", version = "=2.6.1" }
 spacetimedb-physical-plan = { path = "crates/physical-plan", version = "=2.6.1" }
 spacetimedb-primitives = { path = "crates/primitives", version = "=2.6.1" }
+spacetimedb-public-mirror-client = { path = "crates/public-mirror", version = "=2.6.1" }
 spacetimedb-query = { path = "crates/query", version = "=2.6.1" }
 spacetimedb-sats = { path = "crates/sats", version = "=2.6.1" }
 spacetimedb-schema = { path = "crates/schema", version = "=2.6.1" }

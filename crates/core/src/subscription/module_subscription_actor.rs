@@ -655,7 +655,7 @@ impl ModuleSubscriptions {
         self.add_single_subscription_inner(Some(instance), sender, auth, request, timer, _assert)
     }
 
-    fn add_single_subscription_inner<I: WasmInstance>(
+    pub(crate) fn add_single_subscription_inner<I: WasmInstance>(
         &self,
         instance: Option<&mut RefInstance<I>>,
         sender: Arc<ClientConnectionSender>,
@@ -1424,7 +1424,7 @@ impl ModuleSubscriptions {
 
         Ok((Some(metrics), trapped))
     }
-    fn add_multi_subscription_inner<I: WasmInstance>(
+    pub(crate) fn add_multi_subscription_inner<I: WasmInstance>(
         &self,
         instance: Option<&mut RefInstance<I>>,
         sender: Arc<ClientConnectionSender>,
@@ -1605,7 +1605,7 @@ impl ModuleSubscriptions {
         self.add_legacy_subscriber_inner(Some(instance), sender, auth, subscription, timer, _assert)
     }
 
-    fn add_legacy_subscriber_inner<I: WasmInstance>(
+    pub(crate) fn add_legacy_subscriber_inner<I: WasmInstance>(
         &self,
         instance: Option<&mut RefInstance<I>>,
         sender: Arc<ClientConnectionSender>,

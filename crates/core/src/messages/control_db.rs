@@ -97,6 +97,8 @@ pub enum HostType {
     #[default]
     Wasm = 0,
     Js = 1,
+    /// In-memory public-mirror-v1 host (no guest WASM/JS module).
+    Mirror = 2,
 }
 
 impl From<HostType> for ModuleKind {
@@ -104,6 +106,7 @@ impl From<HostType> for ModuleKind {
         match host_type {
             HostType::Wasm => Self::WASM,
             HostType::Js => Self::JS,
+            HostType::Mirror => Self::MIRROR,
         }
     }
 }
@@ -113,6 +116,7 @@ impl From<ModuleKind> for HostType {
         match kind {
             ModuleKind::WASM => Self::Wasm,
             ModuleKind::JS => Self::Js,
+            ModuleKind::MIRROR => Self::Mirror,
             x => unreachable!("missing mapping from module kind {x:?} to host type"),
         }
     }
