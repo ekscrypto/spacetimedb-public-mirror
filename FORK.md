@@ -77,6 +77,10 @@ tables). Each mirrored database runs on its own JobCores thread.
 Clients connect to the local mirror by database name (`bitcraft-live-1`,
 `bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
+Per-mirror connectivity (connecting / subscribing / live / disconnected), table
+sync progress, transaction counts, and reconnect ETA are exposed at
+`GET /v1/mirrors` (JSON, unauthenticated — same posture as `/v1/metrics`).
+
 ### Compatibility harness
 
 ```sh

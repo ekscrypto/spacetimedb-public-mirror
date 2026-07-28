@@ -12,6 +12,7 @@ path = "src/bin/mirror-harness.rs"
 
 [dependencies]
 spacetimedb-client-api-messages.workspace = true
+spacetimedb-client-api.workspace = true
 spacetimedb-core.workspace = true
 spacetimedb-datastore.workspace = true
 spacetimedb-lib = { workspace = true, features = ["serde"] }

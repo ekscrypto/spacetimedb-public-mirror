@@ -21,6 +21,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
 
+use crate::status::MirrorStatusHandle;
+
 const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
 
 #[derive(Debug, Clone)]
@@ -112,6 +114,7 @@ pub async fn connect_and_mirror(
     tables: &[String],
     on_update: ApplyFn,
     live_started: &mut Option<tokio::time::Instant>,
+    status: MirrorStatusHandle,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     let row_types = build_row_types(module_def)?;
@@ -133,6 +136,7 @@ pub async fn connect_and_mirror(
         .map_err(|e| UpstreamError::Connect(e.to_string()))?;
 
     log::info!("public-mirror: upstream websocket established");
+    status.set_connected();
 
     // Wait for IdentityToken before subscribing.
     loop {
@@ -197,6 +201,7 @@ pub async fn connect_and_mirror(
                         .await
                         .map_err(|e| UpstreamError::Decode(format!("apply seed failed: {e:#}")))?;
                     }
+                    status.set_table_live((idx as u32).saturating_add(1));
                     break;
                 }
                 ServerMessage::SubscriptionError(err) => {
@@ -204,7 +209,7 @@ pub async fn connect_and_mirror(
                 }
                 ServerMessage::TransactionUpdate(_) | ServerMessage::TransactionUpdateLight(_) => {
                     // Live updates can arrive interleaved once some tables are subscribed.
-                    handle_live_update(server, &row_types, &on_update).await?;
+                    handle_live_update(server, &row_types, &on_update, &status).await?;
                 }
                 ServerMessage::IdentityToken(_) => {}
                 other => {
@@ -221,6 +226,7 @@ pub async fn connect_and_mirror(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
+    status.set_live();
     *live_started = Some(tokio::time::Instant::now());
 
     // Live loop.
@@ -235,7 +241,7 @@ pub async fn connect_and_mirror(
                 match msg? {
                     Message::Binary(data) => {
                         let server = decode_server_message(&data)?;
-                        handle_live_update(server, &row_types, &on_update).await?;
+                        handle_live_update(server, &row_types, &on_update, &status).await?;
                     }
                     Message::Close(frame) => {
                         let reason = frame
@@ -263,6 +269,7 @@ async fn handle_live_update(
     server: ServerMessage<BsatnFormat>,
     row_types: &HashMap<String, ProductType>,
     on_update: &ApplyFn,
+    status: &MirrorStatusHandle,
 ) -> Result<(), UpstreamError> {
     match server {
         ServerMessage::TransactionUpdate(tu) => {
@@ -284,6 +291,7 @@ async fn handle_live_update(
             on_update(UpstreamUpdate { provenance, tables })
                 .await
                 .map_err(|e| UpstreamError::Decode(format!("apply update failed: {e:#}")))?;
+            status.inc_transactions();
         }
         ServerMessage::TransactionUpdateLight(tul) => {
             let tables = database_update_to_ops(&tul.update, row_types, false)?;

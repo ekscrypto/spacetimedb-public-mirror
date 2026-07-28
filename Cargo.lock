@@ -8526,6 +8526,7 @@ dependencies = [
  "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "spacetimedb-client-api",
  "spacetimedb-client-api-messages",
  "spacetimedb-core",
  "spacetimedb-datastore",

@@ -10,6 +10,7 @@ pub mod identity;
 mod internal;
 pub mod mcp;
 pub mod metrics;
+pub mod mirrors;
 pub mod prometheus;
 pub mod subscribe;
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -15,6 +15,7 @@ use spacetimedb_schema::def::ModuleDef;
 use url::Url;
 
 use crate::schema::public_user_table_names;
+use crate::status::MirrorStatusHandle;
 use crate::upstream::{self, UpstreamConfig, UpstreamUpdate};
 
 /// Configuration for the public-mirror upstream loop.
@@ -81,6 +82,7 @@ pub async fn run_public_mirror_loop(
     module_host: ModuleHost,
     config: PublicMirrorConfig,
     module_def: ModuleDef,
+    status: MirrorStatusHandle,
 ) -> anyhow::Result<()> {
     let tables = match config.tables {
         Some(t) if !t.is_empty() => t,
@@ -89,6 +91,7 @@ pub async fn run_public_mirror_loop(
     if tables.is_empty() {
         anyhow::bail!("no public user tables to mirror");
     }
+    status.set_tables_total(tables.len() as u32);
     log::info!(
         "public-mirror: mirroring {} tables from {} database={}",
         tables.len(),
@@ -132,17 +135,24 @@ pub async fn run_public_mirror_loop(
     let mut backoff_secs: u64 = 1;
 
     loop {
+        status.set_connecting();
         let mut live_started = None;
-        let result =
-            upstream::connect_and_mirror(upstream_cfg.clone(), &module_def, &tables, on_update.clone(), &mut live_started)
-                .await;
-        let lived_for = live_started
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::ZERO);
+        let result = upstream::connect_and_mirror(
+            upstream_cfg.clone(),
+            &module_def,
+            &tables,
+            on_update.clone(),
+            &mut live_started,
+            status.clone(),
+        )
+        .await;
+        let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
         if lived_for >= STABLE_THRESHOLD {
             backoff_secs = 1;
         }
         let sleep_for = Duration::from_secs(backoff_secs);
+        let next_attempt_at = SystemTime::now() + sleep_for;
+        status.set_disconnected(next_attempt_at);
         match result {
             Ok(()) => {
                 log::warn!(

@@ -32,6 +32,7 @@ use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::traits::Program;
 use spacetimedb_paths::server::{ModuleLogsDir, PidFile, ServerDataDir};
 use spacetimedb_paths::standalone::StandaloneDataDirExt;
+use spacetimedb_public_mirror_client::MirrorStatusRegistry;
 use spacetimedb_schema::auto_migrate::{MigrationPolicy, PrettyPrintStyle};
 use spacetimedb_table::page_pool::PagePool;
 use std::sync::Arc;
@@ -57,6 +58,8 @@ pub struct StandaloneEnv {
     _pid_file: PidFile,
     auth_provider: auth::DefaultJwtAuthProvider,
     websocket_options: WebSocketOptions,
+    /// Per-`--mirror` connectivity status for `GET /v1/mirrors` (empty when not mirroring).
+    mirror_statuses: Arc<MirrorStatusRegistry>,
 }
 
 impl StandaloneEnv {
@@ -110,6 +113,7 @@ impl StandaloneEnv {
             _pid_file,
             auth_provider: auth_env,
             websocket_options: config.websocket,
+            mirror_statuses: Arc::new(MirrorStatusRegistry::new()),
         }))
     }
 
@@ -123,6 +127,10 @@ impl StandaloneEnv {
 
     pub fn bsatn_rlb_pool(&self) -> &BsatnRowListBuilderPool {
         &self.host_controller.bsatn_rlb_pool
+    }
+
+    pub fn mirror_status_registry(&self) -> &Arc<MirrorStatusRegistry> {
+        &self.mirror_statuses
     }
 
     pub(crate) fn control_db(&self) -> &ControlDb {
@@ -176,6 +184,10 @@ impl NodeDelegate for StandaloneEnv {
 
     fn client_actor_index(&self) -> &ClientActorIndex {
         &self.client_actor_index
+    }
+
+    fn mirror_statuses(&self) -> spacetimedb_client_api::routes::mirrors::MirrorsResponse {
+        self.mirror_statuses.snapshot()
     }
 
     fn jwt_auth_provider(&self) -> &Self::JwtAuthProviderT {

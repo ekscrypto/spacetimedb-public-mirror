@@ -24,6 +24,7 @@ use spacetimedb_client_api::routes::router;
 use spacetimedb_client_api_messages::name::DatabaseName;
 use spacetimedb_public_mirror_client::runtime::{run_public_mirror_loop, schema_program_hash, PublicMirrorConfig};
 use spacetimedb_public_mirror_client::schema::fetch_and_parse_schema;
+use spacetimedb_public_mirror_client::schema::public_user_table_names;
 use std::str::FromStr;
 use std::time::Duration;
 use url::Url;
@@ -320,7 +321,9 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     db_routes.root_post = db_routes.root_post.layer(DefaultBodyLimit::disable());
     db_routes.db_put = db_routes.db_put.layer(DefaultBodyLimit::disable());
     db_routes.pre_publish = db_routes.pre_publish.layer(DefaultBodyLimit::disable());
-    let extra = axum::Router::new().nest("/health", spacetimedb_client_api::routes::health::router());
+    let extra = axum::Router::new()
+        .nest("/health", spacetimedb_client_api::routes::health::router())
+        .nest("/mirrors", spacetimedb_client_api::routes::mirrors::router());
     let service = router(&ctx, db_routes, IdentityRoutes::default(), extra).with_state(ctx.clone());
 
     // Check if the requested port is available on both IPv4 and IPv6.
@@ -700,6 +703,14 @@ async fn bootstrap_public_mirror(
         .await
         .context("bootstrap_mirror_database failed")?;
 
+    let tables_total = match &tables {
+        Some(t) if !t.is_empty() => t.len() as u32,
+        _ => public_user_table_names(&module_def).len() as u32,
+    };
+    let status = ctx
+        .mirror_status_registry()
+        .register(upstream_url, mirror_database, tables_total);
+
     let mirror_cfg = PublicMirrorConfig {
         upstream: upstream_url.clone(),
         database: mirror_database.to_string(),
@@ -708,7 +719,7 @@ async fn bootstrap_public_mirror(
         connect_timeout: Duration::from_secs(60),
     };
     tokio::spawn(async move {
-        if let Err(e) = run_public_mirror_loop(module_host, mirror_cfg, module_def).await {
+        if let Err(e) = run_public_mirror_loop(module_host, mirror_cfg, module_def, status).await {
             log::error!("public-mirror upstream loop terminated: {e:#}");
         }
     });

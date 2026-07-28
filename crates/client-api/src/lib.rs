@@ -53,6 +53,14 @@ pub trait NodeDelegate: Send + Sync {
     fn gather_metrics(&self) -> Vec<prometheus::proto::MetricFamily>;
     fn client_actor_index(&self) -> &ClientActorIndex;
 
+    /// Per-mirror connectivity status for `GET /v1/mirrors`.
+    ///
+    /// Default is empty (non-mirror deployments). Standalone `--public-mirror-v1`
+    /// overrides this with live upstream status.
+    fn mirror_statuses(&self) -> routes::mirrors::MirrorsResponse {
+        routes::mirrors::MirrorsResponse::default()
+    }
+
     type JwtAuthProviderT: auth::JwtAuthProvider;
     fn jwt_auth_provider(&self) -> &Self::JwtAuthProviderT;
     /// Return the leader [`Host`] of `database_id`.
@@ -486,6 +494,10 @@ impl<T: NodeDelegate + ?Sized> NodeDelegate for Arc<T> {
 
     fn client_actor_index(&self) -> &ClientActorIndex {
         (**self).client_actor_index()
+    }
+
+    fn mirror_statuses(&self) -> routes::mirrors::MirrorsResponse {
+        (**self).mirror_statuses()
     }
 
     fn jwt_auth_provider(&self) -> &Self::JwtAuthProviderT {
