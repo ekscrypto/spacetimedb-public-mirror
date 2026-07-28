@@ -102,12 +102,18 @@ pub enum UpstreamError {
 type ApplyFn = Arc<dyn Fn(UpstreamUpdate) -> BoxFuture<'static, Result<(), anyhow::Error>> + Send + Sync>;
 
 /// Connect to upstream v1, sequentially subscribe to each table, apply seeds and live updates.
+///
+/// When the live update loop begins, `live_started` is set to `Instant::now()` so the
+/// caller can measure how long the session was actually live (for reconnect backoff).
+/// It is left `None` if connect/subscribe fails before the live loop.
 pub async fn connect_and_mirror(
     config: UpstreamConfig,
     module_def: &ModuleDef,
     tables: &[String],
     on_update: ApplyFn,
+    live_started: &mut Option<tokio::time::Instant>,
 ) -> Result<(), UpstreamError> {
+    *live_started = None;
     let row_types = build_row_types(module_def)?;
     let request = build_connect_request(&config)?;
     log::info!(
@@ -215,6 +221,7 @@ pub async fn connect_and_mirror(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
+    *live_started = Some(tokio::time::Instant::now());
 
     // Live loop.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(10));

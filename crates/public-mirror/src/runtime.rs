@@ -123,17 +123,40 @@ pub async fn run_public_mirror_loop(
         connect_timeout: config.connect_timeout,
     };
 
-    // Reconnect loop.
+    // Exponential reconnect backoff (same shape as spacetimedb-relay upstream):
+    // 1s → 2s → 4s → … capped at 30s. Reset only after a session that reached
+    // the live loop and stayed up ≥ STABLE_THRESHOLD — so connect/subscribe
+    // failures (including the 60s connect timeout) keep growing backoff.
+    const BACKOFF_MAX_SECS: u64 = 30;
+    const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
+    let mut backoff_secs: u64 = 1;
+
     loop {
-        match upstream::connect_and_mirror(upstream_cfg.clone(), &module_def, &tables, on_update.clone()).await {
+        let mut live_started = None;
+        let result =
+            upstream::connect_and_mirror(upstream_cfg.clone(), &module_def, &tables, on_update.clone(), &mut live_started)
+                .await;
+        let lived_for = live_started
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if lived_for >= STABLE_THRESHOLD {
+            backoff_secs = 1;
+        }
+        let sleep_for = Duration::from_secs(backoff_secs);
+        match result {
             Ok(()) => {
-                log::warn!("public-mirror: upstream loop exited cleanly; reconnecting in 5s");
+                log::warn!(
+                    "public-mirror: upstream loop exited cleanly; reconnecting in {backoff_secs}s (lived {lived_for:?})"
+                );
             }
             Err(e) => {
-                log::error!("public-mirror: upstream error: {e:#}; reconnecting in 5s");
+                log::error!(
+                    "public-mirror: upstream error: {e:#}; reconnecting in {backoff_secs}s (lived {lived_for:?})"
+                );
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(sleep_for).await;
+        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
     }
 }
 
