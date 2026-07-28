@@ -42,6 +42,16 @@ pub struct TableOps {
     pub inserts: Vec<Bytes>, // BSATN row bytes for `RelationalDB::insert`
 }
 
+/// One externally observed update ready to apply into the mirror.
+///
+/// A batch of these is applied in one executor job (each update in its own
+/// transaction + broadcast) by [`super::module_host::ModuleHost::apply_mirrored_updates`].
+pub struct MirroredUpdate {
+    pub provenance: Option<ExternalProvenance>,
+    pub ops: Vec<TableOps>,
+    pub is_seed: bool,
+}
+
 /// Shared counters updated during a large seed insert (for `/v1/mirrors`).
 #[derive(Clone)]
 pub struct SeedApplyProgress {
@@ -72,6 +82,7 @@ pub fn apply_external_update(
     progress: Option<SeedApplyProgress>,
     is_seed: bool,
 ) -> Result<(), DBError> {
+    deprioritize_mirror_apply_thread();
     let stdb = subs.relational_db();
     let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
 
@@ -169,6 +180,39 @@ pub fn apply_external_update(
 
     let _ = commit_and_broadcast_event(subs, None, event, tx);
     Ok(())
+}
+
+/// Lower the scheduling priority of the mirror's dedicated apply thread (once
+/// per thread, Linux only).
+///
+/// Seed inserts are minutes of pure CPU. When the host has too few cores for
+/// JobCores pinning to isolate database threads from Tokio workers, an insert
+/// competing at equal priority can starve WebSocket servicing across *all*
+/// mirrors. Niceness makes the kernel prefer the I/O-bound socket tasks when
+/// cores are saturated; the insert only slows when the CPU is contended anyway.
+fn deprioritize_mirror_apply_thread() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::cell::Cell;
+        const MIRROR_APPLY_NICENESS: i32 = 5;
+        thread_local! {
+            static DEPRIORITIZED: Cell<bool> = const { Cell::new(false) };
+        }
+        DEPRIORITIZED.with(|d| {
+            if !d.replace(true) {
+                // SAFETY: setpriority with PRIO_PROCESS and who=0 adjusts the
+                // calling thread's niceness on Linux; no memory is touched.
+                // (`as _` bridges the glibc/musl disagreement on `which`'s type.)
+                let rc = unsafe { nix::libc::setpriority(nix::libc::PRIO_PROCESS as _, 0, MIRROR_APPLY_NICENESS) };
+                if rc != 0 {
+                    log::debug!(
+                        "public-mirror: setpriority({MIRROR_APPLY_NICENESS}) failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        });
+    }
 }
 
 /// Bootstrap user tables (and views) from a [`ModuleDef`] without running an init reducer.

@@ -1,4 +1,4 @@
-//! Public-mirror apply loop: upstream → `ModuleHost::apply_mirrored_update`.
+//! Public-mirror apply loop: upstream → `ModuleHost::apply_mirrored_updates`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use spacetimedb::db::relational_db::RelationalDB;
 use spacetimedb::host::module_host::ModuleHost;
-use spacetimedb::host::public_mirror::{ExternalProvenance, TableOps};
+use spacetimedb::host::public_mirror::{ExternalProvenance, MirroredUpdate, TableOps};
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_primitives::TableId;
 use spacetimedb_schema::def::ModuleDef;
@@ -45,10 +45,8 @@ fn resolve_table_ids(stdb: &RelationalDB, names: &[String]) -> anyhow::Result<Ha
     Ok(map)
 }
 
-fn update_to_table_ops(
-    update: UpstreamUpdate,
-    table_ids: &HashMap<String, TableId>,
-) -> anyhow::Result<(Option<ExternalProvenance>, Vec<TableOps>)> {
+fn update_to_mirrored(update: UpstreamUpdate, table_ids: &HashMap<String, TableId>) -> Option<MirroredUpdate> {
+    let is_seed = update.is_seed;
     let provenance = update.provenance.map(|p| ExternalProvenance {
         reducer_name: p.reducer_name,
         caller_identity: p.caller_identity,
@@ -72,13 +70,22 @@ fn update_to_table_ops(
             inserts: t.inserts,
         });
     }
-    Ok((provenance, ops))
+    if ops.is_empty() {
+        return None;
+    }
+    Some(MirroredUpdate {
+        provenance,
+        ops,
+        is_seed,
+    })
 }
 
 /// Connect upstream, sequential-subscribe public tables, apply seed + live updates into `module_host`.
 ///
-/// Each apply is scheduled onto the mirror's dedicated [`spacetimedb::util::jobs::SingleThreadedExecutor`]
-/// via [`ModuleHost::apply_mirrored_update`], matching SpacetimeDB's one-thread-per-database model.
+/// Updates are applied in **batches** (one executor job per batch) onto the mirror's
+/// dedicated [`spacetimedb::util::jobs::SingleThreadedExecutor`] via
+/// [`ModuleHost::apply_mirrored_updates`], matching SpacetimeDB's one-thread-per-database
+/// model while amortizing the cross-thread round trip when a backlog has built up.
 ///
 /// `subscribe_gate` serialises concurrent **wire** seeds (and initial connect) across mirrors.
 /// The permit is released before each local seed apply so a long insert cannot block reconnects.
@@ -108,15 +115,17 @@ pub async fn run_public_mirror_loop(
     let table_ids = resolve_table_ids(&stdb, &tables)?;
 
     let on_update = Arc::new(
-        move |update: UpstreamUpdate,
+        move |updates: Vec<UpstreamUpdate>,
               progress: Option<crate::status::SeedApplyProgress>|
               -> BoxFuture<'static, Result<(), anyhow::Error>> {
             let module_host = module_host.clone();
             let table_ids = table_ids.clone();
             async move {
-                let is_seed = update.is_seed;
-                let (provenance, ops) = update_to_table_ops(update, &table_ids)?;
-                if ops.is_empty() {
+                let batch: Vec<MirroredUpdate> = updates
+                    .into_iter()
+                    .filter_map(|u| update_to_mirrored(u, &table_ids))
+                    .collect();
+                if batch.is_empty() {
                     return Ok(());
                 }
                 let progress = progress.map(|p| spacetimedb::host::public_mirror::SeedApplyProgress {
@@ -124,7 +133,7 @@ pub async fn run_public_mirror_loop(
                     last_apply_unix_ms: p.last_apply_unix_ms,
                 });
                 module_host
-                    .apply_mirrored_update(provenance, ops, progress, is_seed)
+                    .apply_mirrored_updates(batch, progress)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 Ok(())
@@ -148,15 +157,23 @@ pub async fn run_public_mirror_loop(
     const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
     let mut backoff_secs: u64 = 1;
 
+    // Subscribe order. When a session dies on a specific table, that table is
+    // moved to the front so the next attempt transfers the riskiest (largest /
+    // slowest) seed while the connection is freshest, instead of after
+    // re-seeding every other table first.
+    let mut table_order = tables.clone();
+
     loop {
         let permit = acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
         let mut live_started = None;
+        let mut failed_table = None;
         let result = upstream::connect_and_mirror(
             upstream_cfg.clone(),
             &module_def,
-            &tables,
+            &table_order,
             on_update.clone(),
             &mut live_started,
+            &mut failed_table,
             status.clone(),
             Arc::clone(&subscribe_gate),
             Some(permit),
@@ -181,6 +198,14 @@ pub async fn run_public_mirror_loop(
                 );
             }
         }
+        if let Some(failed) = failed_table
+            && let Some(pos) = table_order.iter().position(|t| *t == failed)
+            && pos != 0
+        {
+            let t = table_order.remove(pos);
+            log::info!("public-mirror: prioritizing previously failed table `{t}` on next attempt");
+            table_order.insert(0, t);
+        }
         tokio::time::sleep(sleep_for).await;
         backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
     }
@@ -194,9 +219,7 @@ async fn acquire_subscribe_slot(
     status.set_waiting();
     let available = gate.available_permits();
     if available == 0 {
-        log::info!(
-            "public-mirror: `{database}` waiting for subscribe slot (all slots in use)"
-        );
+        log::info!("public-mirror: `{database}` waiting for subscribe slot (all slots in use)");
     }
     let permit = Arc::clone(gate)
         .acquire_owned()

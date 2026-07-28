@@ -377,8 +377,14 @@ impl MirrorStatusHandle {
 
     /// Lifetime counter: one committed upstream TransactionUpdate successfully applied.
     pub fn inc_transactions(&self) {
+        self.inc_transactions_by(1);
+    }
+
+    /// Lifetime counter: `n` committed upstream TransactionUpdates successfully
+    /// applied (batched applies report once per batch).
+    pub fn inc_transactions_by(&self, n: u64) {
         self.with_mut(|s| {
-            s.transactions_processed = s.transactions_processed.saturating_add(1);
+            s.transactions_processed = s.transactions_processed.saturating_add(n);
         });
     }
 

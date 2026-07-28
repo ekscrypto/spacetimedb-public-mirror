@@ -86,12 +86,23 @@ other mirror in `waiting`. Reconnecting mirrors may show `current_table_phase:
 queued` while they wait for the next free wire slot; `tables_live` is preserved
 and live TUs for already-subscribed tables keep applying while queued.
 
+**WebSocket servicing is never blocked on database work.** The socket loop only
+reads, decodes, and enqueues; applies run from a FIFO queue whose in-flight job
+(on the mirror's dedicated JobCores thread) is polled *concurrently* with
+socket reads and Pings. A stuck or multi-minute insert costs queue depth (live
+backlog is capped at 1 GiB decoded — beyond that the session errors and
+reconnects instead of growing without bound), never the connection. Queued live
+updates are applied in batches (one executor job per batch) to amortize the
+cross-thread round trip, and whatever was already received is drained to the
+database before a failed session returns. On Linux the mirror apply threads run
+at niceness 5 so saturating seed inserts yield the CPU to socket tasks.
+
 **Live invariant:** once a mirror reaches `live`, it does not touch the subscribe
 gate again until disconnect/reconnect. Another mirror's subscribe or seed must
 not block that database's table updates (dedicated JobCores thread per DB; large
-seed BSATN decode runs on Tokio's blocking pool so shared async workers stay
-free for live WebSocket tasks). It is OK for a *disconnected* mirror to stay
-`waiting` until a subscribe slot opens.
+frame decompress/decode runs on Tokio's blocking pool so shared async workers
+stay free for live WebSocket tasks). It is OK for a *disconnected* mirror to
+stay `waiting` until a subscribe slot opens.
 
 Raise the concurrency only if you have evidence the upstream can absorb concurrent
 large-shard wire seeds.
@@ -107,10 +118,28 @@ inserted locally. Seed applies are **idempotent**: each table is truncated in
 the same transaction before its snapshot rows are inserted, so a reconnect
 re-seed converges instead of crash-looping on unique-constraint violations
 against rows left over from the previous session (downstream subscribers only
-see the net diff). Large full-table seeds (e.g. `location_state`) are kept: the
-upstream client leaves tungstenite message/frame caps unlimited, never splits
-the WebSocket (so auto-Pongs flush mid-reassembly), and keeps client Pings
-flowing during seed wait and apply.
+see the net diff).
+
+Large full-table seeds (e.g. `location_state`, 1 GiB+) are kept alive by
+design:
+
+- The client requests **Brotli** compression (`compression=Brotli`), cutting
+  large seed snapshots ~7–10x on the wire. Whole-message and per-query-update
+  brotli/gzip are both decompressed transparently.
+- The subscribe timeout is **stall-based**: a subscribe only fails when the
+  socket has been completely silent for 5 minutes (plus a generous 2 h absolute
+  cap). A seed that is still trickling in is never killed mid-transfer.
+- The upstream client leaves tungstenite message/frame caps unlimited, never
+  splits the WebSocket (so auto-Pongs flush mid-reassembly), and keeps client
+  Pings flowing during seed wait and apply.
+- Seed rows are zero-copy slices of the decoded frame (one shared allocation),
+  not per-row copies.
+- If a session dies while subscribing a specific table, that table is
+  subscribed **first** on the next attempt — the riskiest transfer happens
+  while the connection is freshest instead of after re-seeding every other
+  table.
+- The post-connect `IdentityToken` wait is bounded (60 s) so a dead upstream
+  cannot hold a subscribe-gate slot forever.
 
 ### Compatibility harness
 

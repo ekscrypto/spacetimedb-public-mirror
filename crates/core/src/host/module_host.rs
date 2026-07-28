@@ -1850,30 +1850,43 @@ impl ModuleHost {
         Ok(executor.run_sync_job(move |_| f()).await)
     }
 
-    /// Apply an upstream mirrored update on this database's dedicated thread.
+    /// Apply a batch of upstream mirrored updates on this database's dedicated
+    /// thread, in order, each in its own transaction + broadcast.
     ///
+    /// One executor job per batch amortizes the cross-thread round trip when a
+    /// backlog of live updates has built up (e.g. queued behind a seed apply).
     /// Serializes with other mirror DB work (subscriptions, one-off queries,
     /// client connect/disconnect) the same way WASM reducers serialize on their
     /// [`SingleThreadedExecutor`].
-    pub async fn apply_mirrored_update(
+    ///
+    /// `progress` is attached to seed updates only.
+    pub async fn apply_mirrored_updates(
         &self,
-        provenance: Option<super::public_mirror::ExternalProvenance>,
-        ops: Vec<super::public_mirror::TableOps>,
+        updates: Vec<super::public_mirror::MirroredUpdate>,
         progress: Option<super::public_mirror::SeedApplyProgress>,
-        is_seed: bool,
     ) -> Result<(), DBError> {
         self.guard_closed()
             .map_err(|_| DBError::Other(anyhow::anyhow!("module closed")))?;
         let ModuleHostInner::Mirror(host) = &*self.inner else {
             return Err(DBError::Other(anyhow::anyhow!(
-                "apply_mirrored_update requires a public-mirror host"
+                "apply_mirrored_updates requires a public-mirror host"
             )));
         };
         let executor = host.executor.clone();
         let subs = self.subscriptions().clone();
         executor
             .run_sync_job(move |_| {
-                super::public_mirror::apply_external_update(&subs, provenance, ops, progress, is_seed)
+                for update in updates {
+                    let progress = if update.is_seed { progress.clone() } else { None };
+                    super::public_mirror::apply_external_update(
+                        &subs,
+                        update.provenance,
+                        update.ops,
+                        progress,
+                        update.is_seed,
+                    )?;
+                }
+                Ok(())
             })
             .await
     }

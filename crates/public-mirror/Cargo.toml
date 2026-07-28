@@ -21,7 +21,9 @@ spacetimedb-sats = { workspace = true, features = ["serde"] }
 spacetimedb-schema.workspace = true
 
 anyhow.workspace = true
+brotli.workspace = true
 bytes.workspace = true
+flate2.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 futures.workspace = true
 futures-util.workspace = true
