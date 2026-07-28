@@ -1,12 +1,14 @@
-//! Public-mirror apply loop: upstream → `apply_external_update`.
+//! Public-mirror apply loop: upstream → `ModuleHost::apply_mirrored_update`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use spacetimedb::db::relational_db::RelationalDB;
 use spacetimedb::host::module_host::ModuleHost;
-use spacetimedb::host::public_mirror::{apply_external_update, ExternalProvenance, TableOps};
+use spacetimedb::host::public_mirror::{ExternalProvenance, TableOps};
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_primitives::TableId;
 use spacetimedb_schema::def::ModuleDef;
@@ -72,6 +74,9 @@ fn update_to_table_ops(
 }
 
 /// Connect upstream, sequential-subscribe public tables, apply seed + live updates into `module_host`.
+///
+/// Each apply is scheduled onto the mirror's dedicated [`spacetimedb::util::jobs::SingleThreadedExecutor`]
+/// via [`ModuleHost::apply_mirrored_update`], matching SpacetimeDB's one-thread-per-database model.
 pub async fn run_public_mirror_loop(
     module_host: ModuleHost,
     config: PublicMirrorConfig,
@@ -93,18 +98,25 @@ pub async fn run_public_mirror_loop(
 
     let stdb = module_host.relational_db().clone();
     let table_ids = resolve_table_ids(&stdb, &tables)?;
-    let subs = module_host.subscriptions().clone();
 
-    let on_update = Arc::new(move |update: UpstreamUpdate| -> Result<(), anyhow::Error> {
-        let (provenance, ops) = update_to_table_ops(update, &table_ids)?;
-        if ops.is_empty() {
-            return Ok(());
+    let on_update = Arc::new(move |update: UpstreamUpdate| -> BoxFuture<'static, Result<(), anyhow::Error>> {
+        let module_host = module_host.clone();
+        let table_ids = table_ids.clone();
+        async move {
+            let (provenance, ops) = update_to_table_ops(update, &table_ids)?;
+            if ops.is_empty() {
+                return Ok(());
+            }
+            let n_ins: usize = ops.iter().map(|o| o.inserts.len()).sum();
+            let n_del: usize = ops.iter().map(|o| o.deletes.len()).sum();
+            module_host
+                .apply_mirrored_update(provenance, ops)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            log::debug!("public-mirror: applied update (+{n_ins} -{n_del})");
+            Ok(())
         }
-        let n_ins: usize = ops.iter().map(|o| o.inserts.len()).sum();
-        let n_del: usize = ops.iter().map(|o| o.deletes.len()).sum();
-        apply_external_update(&subs, provenance, ops)?;
-        log::debug!("public-mirror: applied update (+{n_ins} -{n_del})");
-        Ok(())
+        .boxed()
     });
 
     let upstream_cfg = UpstreamConfig {

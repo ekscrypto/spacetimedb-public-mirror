@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use spacetimedb_client_api_messages::websocket::common::QuerySetId;
@@ -98,7 +99,7 @@ pub enum UpstreamError {
     Closed(String),
 }
 
-type ApplyFn = Arc<dyn Fn(UpstreamUpdate) -> Result<(), anyhow::Error> + Send + Sync>;
+type ApplyFn = Arc<dyn Fn(UpstreamUpdate) -> BoxFuture<'static, Result<(), anyhow::Error>> + Send + Sync>;
 
 /// Connect to upstream v1, sequentially subscribe to each table, apply seeds and live updates.
 pub async fn connect_and_mirror(
@@ -187,6 +188,7 @@ pub async fn connect_and_mirror(
                             provenance: None,
                             tables: tables_ops,
                         })
+                        .await
                         .map_err(|e| UpstreamError::Decode(format!("apply seed failed: {e:#}")))?;
                     }
                     break;
@@ -196,7 +198,7 @@ pub async fn connect_and_mirror(
                 }
                 ServerMessage::TransactionUpdate(_) | ServerMessage::TransactionUpdateLight(_) => {
                     // Live updates can arrive interleaved once some tables are subscribed.
-                    handle_live_update(server, &row_types, &on_update)?;
+                    handle_live_update(server, &row_types, &on_update).await?;
                 }
                 ServerMessage::IdentityToken(_) => {}
                 other => {
@@ -226,7 +228,7 @@ pub async fn connect_and_mirror(
                 match msg? {
                     Message::Binary(data) => {
                         let server = decode_server_message(&data)?;
-                        handle_live_update(server, &row_types, &on_update)?;
+                        handle_live_update(server, &row_types, &on_update).await?;
                     }
                     Message::Close(frame) => {
                         let reason = frame
@@ -250,7 +252,7 @@ pub async fn connect_and_mirror(
     }
 }
 
-fn handle_live_update(
+async fn handle_live_update(
     server: ServerMessage<BsatnFormat>,
     row_types: &HashMap<String, ProductType>,
     on_update: &ApplyFn,
@@ -273,6 +275,7 @@ fn handle_live_update(
                 return Ok(());
             }
             on_update(UpstreamUpdate { provenance, tables })
+                .await
                 .map_err(|e| UpstreamError::Decode(format!("apply update failed: {e:#}")))?;
         }
         ServerMessage::TransactionUpdateLight(tul) => {
@@ -284,6 +287,7 @@ fn handle_live_update(
                 provenance: None,
                 tables,
             })
+            .await
             .map_err(|e| UpstreamError::Decode(format!("apply light update failed: {e:#}")))?;
         }
         ServerMessage::SubscriptionError(err) => {

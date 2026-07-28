@@ -397,6 +397,18 @@ enum ModuleHostInner {
 struct MirrorModuleHost {
     replica_ctx: Arc<ReplicaContext>,
     scheduler: Scheduler,
+    /// Dedicated OS thread for this mirror database (matches WASM one-thread-per-DB).
+    executor: SingleThreadedExecutor<()>,
+}
+
+// Linux thread names expose at most 15 bytes, so keep the database identity
+// suffix short enough to survive after the `mir-` prefix.
+const MIRROR_THREAD_NAME_DATABASE_ID_SUFFIX_LEN: usize = 10;
+
+fn mirror_worker_thread_name(database_identity: &Identity) -> String {
+    let hex = database_identity.to_hex();
+    let suffix = &hex.as_str()[hex.as_str().len() - MIRROR_THREAD_NAME_DATABASE_ID_SUFFIX_LEN..];
+    format!("mir-{suffix}")
 }
 
 struct CallTimerGuard {
@@ -1800,21 +1812,66 @@ impl ModuleHost {
     }
 
     /// Create a public-mirror-v1 host with no guest WASM/JS instance.
+    ///
+    /// `core` is consumed into a [`SingleThreadedExecutor`] so all subsequent
+    /// mut/tx work for this mirror runs on one dedicated OS thread, matching
+    /// the WASM one-thread-per-database model.
     pub fn new_mirror(
         info: Arc<ModuleInfo>,
         replica_ctx: Arc<ReplicaContext>,
         scheduler: Scheduler,
+        core: AllocatedJobCore,
         on_panic: impl Fn() + Send + Sync + 'static,
     ) -> Self {
+        let thread_name = mirror_worker_thread_name(&info.database_identity);
+        let executor = core.spawn_executor((), thread_name);
         ModuleHost {
             info,
             inner: Arc::new(ModuleHostInner::Mirror(Box::new(MirrorModuleHost {
                 replica_ctx,
                 scheduler,
+                executor,
             }))),
             on_panic: Arc::new(on_panic),
             closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Run `f` on this public-mirror host's dedicated database thread.
+    async fn run_on_mirror_thread<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> Result<R, NoSuchModule>
+    where
+        R: Send + 'static,
+    {
+        self.guard_closed()?;
+        let ModuleHostInner::Mirror(host) = &*self.inner else {
+            return Err(NoSuchModule);
+        };
+        let executor = host.executor.clone();
+        Ok(executor.run_sync_job(move |_| f()).await)
+    }
+
+    /// Apply an upstream mirrored update on this database's dedicated thread.
+    ///
+    /// Serializes with other mirror DB work (subscriptions, one-off queries,
+    /// client connect/disconnect) the same way WASM reducers serialize on their
+    /// [`SingleThreadedExecutor`].
+    pub async fn apply_mirrored_update(
+        &self,
+        provenance: Option<super::public_mirror::ExternalProvenance>,
+        ops: Vec<super::public_mirror::TableOps>,
+    ) -> Result<(), DBError> {
+        self.guard_closed()
+            .map_err(|_| DBError::Other(anyhow::anyhow!("module closed")))?;
+        let ModuleHostInner::Mirror(host) = &*self.inner else {
+            return Err(DBError::Other(anyhow::anyhow!(
+                "apply_mirrored_update requires a public-mirror host"
+            )));
+        };
+        let executor = host.executor.clone();
+        let subs = self.subscriptions().clone();
+        executor
+            .run_sync_job(move |_| super::public_mirror::apply_external_update(&subs, provenance, ops))
+            .await
     }
 
     #[inline]
@@ -2021,9 +2078,14 @@ impl ModuleHost {
     ) -> Result<Option<ExecutionMetrics>, DBError> {
         let metric = cmd.metric();
 
-        // public-mirror-v1 has no guest instance; run subscription ops with host: None.
+        // public-mirror-v1 has no guest instance; run subscription ops on the
+        // dedicated database thread (with host: None).
         if self.is_public_mirror() {
-            let result = self.call_view_command_for_mirror(cmd);
+            let this = self.clone();
+            let result = self
+                .run_on_mirror_thread(move || this.call_view_command_for_mirror(cmd))
+                .await
+                .map_err(|e| DBError::Other(anyhow::anyhow!(e)))?;
             Self::record_view_command_round_trip(&self.info, metric);
             return result;
         }
@@ -2131,15 +2193,20 @@ impl ModuleHost {
     pub async fn disconnect_client(&self, client_id: ClientActorId) {
         log::trace!("disconnecting client {client_id}");
         if self.is_public_mirror() {
-            self.info.subscriptions.remove_subscriber(client_id);
-            let stdb = self.relational_db();
-            let database_identity = stdb.database_identity();
-            if let Err(e) = stdb.with_auto_commit(Workload::Internal, |tx| {
-                tx.delete_st_client(client_id.identity, client_id.connection_id, database_identity)
-                    .map_err(DBError::from)
-            }) {
-                log::error!("Error deleting mirror client from st_client: {e}");
-            }
+            let info = self.info.clone();
+            let stdb = self.relational_db().clone();
+            let _ = self
+                .run_on_mirror_thread(move || {
+                    info.subscriptions.remove_subscriber(client_id);
+                    let database_identity = stdb.database_identity();
+                    if let Err(e) = stdb.with_auto_commit(Workload::Internal, |tx| {
+                        tx.delete_st_client(client_id.identity, client_id.connection_id, database_identity)
+                            .map_err(DBError::from)
+                    }) {
+                        log::error!("Error deleting mirror client from st_client: {e}");
+                    }
+                })
+                .await;
             return;
         }
         if let Err(e) = call_instance!(
@@ -2191,22 +2258,27 @@ impl ModuleHost {
     ) -> Result<(), ClientConnectedError> {
         if self.is_public_mirror() {
             // No lifecycle reducers on a mirror; just record the client in st_client.
-            let stdb = self.relational_db();
-            let workload = Workload::reducer_no_args(
-                ReducerName::new(Identifier::new_assume_valid("call_identity_connected".into())),
-                caller_auth.claims.identity,
-                caller_connection_id,
-            );
-            return stdb
-                .with_auto_commit(workload, |tx| {
-                    tx.insert_st_client(
+            let stdb = self.relational_db().clone();
+            return self
+                .run_on_mirror_thread(move || {
+                    let workload = Workload::reducer_no_args(
+                        ReducerName::new(Identifier::new_assume_valid("call_identity_connected".into())),
                         caller_auth.claims.identity,
                         caller_connection_id,
-                        &caller_auth.jwt_payload,
-                    )
-                    .map_err(DBError::from)
+                    );
+                    stdb.with_auto_commit(workload, |tx| {
+                        tx.insert_st_client(
+                            caller_auth.claims.identity,
+                            caller_connection_id,
+                            &caller_auth.jwt_payload,
+                        )
+                        .map_err(DBError::from)
+                    })
+                    .map_err(|e| ClientConnectedError::DBError(e.into()))
                 })
-                .map_err(|e| ClientConnectedError::DBError(e.into()));
+                .await
+                .map_err(|e| ClientConnectedError::DBError(Box::new(DBError::Other(anyhow::anyhow!(e)))))
+                .and_then(std::convert::identity);
         }
         call_instance!(
             self,
@@ -2352,20 +2424,24 @@ impl ModuleHost {
         caller_connection_id: ConnectionId,
     ) -> Result<(), ReducerCallError> {
         if self.is_public_mirror() {
-            let stdb = self.relational_db();
-            let database_identity = stdb.database_identity();
-            let workload = Workload::reducer_no_args(
-                ReducerName::new(Identifier::new_assume_valid("__identity_disconnected__".into())),
-                caller_identity,
-                caller_connection_id,
-            );
-            let _ = stdb.with_auto_commit(workload, |tx| {
-                if tx.st_client_row(caller_identity, caller_connection_id).is_none() {
-                    return Ok(());
-                }
-                tx.delete_st_client(caller_identity, caller_connection_id, database_identity)
-                    .map_err(DBError::from)
-            });
+            let stdb = self.relational_db().clone();
+            let _ = self
+                .run_on_mirror_thread(move || {
+                    let database_identity = stdb.database_identity();
+                    let workload = Workload::reducer_no_args(
+                        ReducerName::new(Identifier::new_assume_valid("__identity_disconnected__".into())),
+                        caller_identity,
+                        caller_connection_id,
+                    );
+                    let _ = stdb.with_auto_commit(workload, |tx| {
+                        if tx.st_client_row(caller_identity, caller_connection_id).is_none() {
+                            return Ok(());
+                        }
+                        tx.delete_st_client(caller_identity, caller_connection_id, database_identity)
+                            .map_err(DBError::from)
+                    });
+                })
+                .await;
             return Ok(());
         }
         call_instance!(
@@ -3375,16 +3451,21 @@ impl ModuleHost {
     }
 
     async fn one_off_query_with_params(&self, request: OneOffQueryRequest) -> Result<(), anyhow::Error> {
-        // public-mirror-v1 has no guest instance; run the query inline.
+        // public-mirror-v1 has no guest instance; run the query on the DB thread.
         if self.is_public_mirror() {
             let info = self.info.clone();
-            let timer = request.timer();
-            let res = request.run();
-            if let Err(err) = &res {
-                log::warn!("mirror one-off query failed: {err:#}");
-            }
-            ModuleHost::record_one_off_query_round_trip(&info, timer);
-            return res.map(|_| ());
+            return self
+                .run_on_mirror_thread(move || {
+                    let timer = request.timer();
+                    let res = request.run();
+                    if let Err(err) = &res {
+                        log::warn!("mirror one-off query failed: {err:#}");
+                    }
+                    ModuleHost::record_one_off_query_round_trip(&info, timer);
+                    res.map(|_| ())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
 
         let label = request.label();

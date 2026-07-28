@@ -768,6 +768,8 @@ impl HostController {
 
     /// Bootstrap an in-memory public-mirror-v1 host and register it under `replica_id`.
     ///
+    /// Allocates a [`crate::util::jobs::JobCores`] slot and spawns a dedicated
+    /// database thread for the mirror, matching the WASM one-thread-per-database model.
     /// Standalone CLI wiring should call this instead of the normal publish/launch path.
     /// Tables are created from `module_def` without running an init reducer.
     pub async fn bootstrap_mirror_database(
@@ -834,6 +836,7 @@ impl HostController {
             info,
             replica_ctx.clone(),
             scheduler.clone(),
+            self.db_cores.take(),
             self.unregister_fn(replica_id),
         );
 
