@@ -70,7 +70,8 @@ cargo build -p spacetimedb-standalone --release
 always rejected. Pass `--reject-one-off-query` to also reject `OneOffQuery`
 (allowed by default). Each `--mirror` is `<upstream-url>/<database-name>`; token
 and `--mirror-table` are shared across all mirrors. Token may also come from
-`--mirror-token`, `BITCRAFT_TOKEN`, `MIRROR_TOKEN`, or `MIRROR_TOKEN_FILE`. Use
+`--mirror-token`, `BITCRAFT_TOKEN`, `MIRROR_TOKEN`, `RELAY_UPSTREAM_TOKEN`,
+or `MIRROR_TOKEN_FILE`. Use
 `--mirror-table` to limit the upstream subscribe set (default: all public user
 tables). Each mirrored database runs on its own JobCores thread.
 

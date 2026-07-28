@@ -125,7 +125,8 @@ pub fn cli() -> clap::Command {
             Arg::new("mirror_token")
                 .long("mirror-token")
                 .help(
-                    "Bearer token for upstream auth (also BITCRAFT_TOKEN or MIRROR_TOKEN env). \
+                    "Bearer token for upstream auth (also BITCRAFT_TOKEN, MIRROR_TOKEN, or \
+                     RELAY_UPSTREAM_TOKEN env). \
                      Optional for --public-mirror-v1; shared by all --mirror entries",
                 )
                 .requires("public_mirror_v1"),
@@ -135,7 +136,8 @@ pub fn cli() -> clap::Command {
                 .long("mirror-token-file")
                 .help(
                     "Path to a file containing the upstream bearer token (also MIRROR_TOKEN_FILE env). \
-                     Multi-line files are supported: the first eyJ… JWT line is used.",
+                     Multi-line files are supported: the first eyJ… JWT line is used \
+                     (including NAME=eyJ… lines such as /etc/relay/upstream.env).",
                 )
                 .requires("public_mirror_v1")
                 .value_parser(clap::value_parser!(std::path::PathBuf)),
@@ -735,11 +737,12 @@ fn resolve_mirror_token(args: &ArgMatches) -> anyhow::Result<Option<String>> {
     if let Some(tok) = args.get_one::<String>("mirror_token") {
         return Ok(Some(normalize_mirror_token(tok)));
     }
-    if let Ok(tok) = std::env::var("BITCRAFT_TOKEN") {
-        return Ok(Some(normalize_mirror_token(&tok)));
-    }
-    if let Ok(tok) = std::env::var("MIRROR_TOKEN") {
-        return Ok(Some(normalize_mirror_token(&tok)));
+    for key in ["BITCRAFT_TOKEN", "MIRROR_TOKEN", "RELAY_UPSTREAM_TOKEN"] {
+        if let Ok(tok) = std::env::var(key) {
+            if !tok.trim().is_empty() {
+                return Ok(Some(normalize_mirror_token(&tok)));
+            }
+        }
     }
     let file = args
         .get_one::<std::path::PathBuf>("mirror_token_file")
@@ -758,10 +761,18 @@ fn normalize_mirror_token(raw: &str) -> String {
     // Prefer an explicit JWT line inside multi-line developer-token files.
     // Split on ASCII newlines and Unicode line/paragraph separators (U+2028/U+2029),
     // which some clipboard/export paths insert instead of `\n`.
+    // Also accept `NAME=eyJ…` lines (e.g. /etc/relay/upstream.env).
     for line in trimmed.split(|c: char| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')) {
         let line = line.trim();
-        if line.starts_with("eyJ") {
-            return line.to_string();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let value = line
+            .split_once('=')
+            .map(|(_, v)| v.trim().trim_matches('"').trim_matches('\''))
+            .unwrap_or(line);
+        if value.starts_with("eyJ") {
+            return value.to_string();
         }
     }
     let tok = trimmed
