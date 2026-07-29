@@ -1824,7 +1824,7 @@ impl ModuleHost {
         on_panic: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         let thread_name = mirror_worker_thread_name(&info.database_identity);
-        let executor = core.spawn_executor((), thread_name);
+        let executor = core.spawn_mirror_executor((), thread_name);
         ModuleHost {
             info,
             inner: Arc::new(ModuleHostInner::Mirror(Box::new(MirrorModuleHost {

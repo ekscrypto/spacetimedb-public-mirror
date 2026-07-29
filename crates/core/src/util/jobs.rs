@@ -11,7 +11,16 @@ use tokio::runtime;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument;
 
-use crate::util::thread_scheduling::apply_compute_thread_hint;
+use crate::util::thread_scheduling::{apply_compute_thread_hint, deprioritize_mirror_background_thread};
+
+/// Scheduler hint applied when a [`SingleThreadedExecutor`] thread starts.
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+pub enum ExecutorThreadScheduling {
+    #[default]
+    Default,
+    /// Public-mirror DB worker: lower priority than Tokio I/O workers.
+    MirrorBackground,
+}
 
 /// A handle to a pool of Tokio executors for running database WASM code on.
 ///
@@ -221,7 +230,32 @@ pub struct AllocatedJobCore {
 impl AllocatedJobCore {
     /// Spawn a [`SingleThreadedExecutor`] for this allocated core.
     pub fn spawn_executor<S: Send + 'static>(self, state: S, name: impl Into<String>) -> SingleThreadedExecutor<S> {
-        SingleThreadedExecutor::spawn_and_pin(Arc::new(self.guard), self.pinner, state, Some(name.into()))
+        self.spawn_executor_with_scheduling(state, name, ExecutorThreadScheduling::Default)
+    }
+
+    /// Like [`Self::spawn_executor`], but deprioritizes the worker thread for
+    /// public-mirror database work.
+    pub fn spawn_mirror_executor<S: Send + 'static>(
+        self,
+        state: S,
+        name: impl Into<String>,
+    ) -> SingleThreadedExecutor<S> {
+        self.spawn_executor_with_scheduling(state, name, ExecutorThreadScheduling::MirrorBackground)
+    }
+
+    fn spawn_executor_with_scheduling<S: Send + 'static>(
+        self,
+        state: S,
+        name: impl Into<String>,
+        scheduling: ExecutorThreadScheduling,
+    ) -> SingleThreadedExecutor<S> {
+        SingleThreadedExecutor::spawn_and_pin(
+            Arc::new(self.guard),
+            self.pinner,
+            state,
+            Some(name.into()),
+            scheduling,
+        )
     }
 }
 
@@ -309,6 +343,7 @@ impl<S: Send + 'static> SingleThreadedExecutor<S> {
         mut pinner: CorePinner,
         mut state: S,
         name: Option<String>,
+        scheduling: ExecutorThreadScheduling,
     ) -> Self {
         let (job_tx, mut job_rx) = mpsc::unbounded_channel::<ExecutorJob<S>>();
 
@@ -322,6 +357,9 @@ impl<S: Send + 'static> SingleThreadedExecutor<S> {
         let worker = move || {
             let _guard = guard;
             pinner.pin_now();
+            if scheduling == ExecutorThreadScheduling::MirrorBackground {
+                deprioritize_mirror_background_thread();
+            }
 
             let _entered = rt.enter();
             let local = tokio::task::LocalSet::new();

@@ -97,7 +97,7 @@ backlog is capped at 1 GiB decoded — beyond that the session errors and
 reconnects instead of growing without bound), never the connection. Queued live
 updates are applied in batches (one executor job per batch) to amortize the
 cross-thread round trip, and whatever was already received is drained to the
-database before a failed session returns. On Linux the mirror apply threads run
+database before a failed session returns. On Linux mirror DB worker threads and offloaded seed-decode blocking tasks run
 at niceness 5 so saturating seed inserts yield the CPU to socket tasks.
 
 **Live invariant:** once a mirror reaches `live`, it does not touch the subscribe

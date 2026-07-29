@@ -34,6 +34,7 @@ use spacetimedb_client_api_messages::websocket::v1::{
     BsatnFormat, ClientMessage, CompressableQueryUpdate, DatabaseUpdate, QueryUpdate, ServerMessage, SubscribeMulti,
     TransactionUpdate, TransactionUpdateLight, UpdateStatus,
 };
+use spacetimedb::util::thread_scheduling::deprioritize_mirror_background_thread;
 use spacetimedb_lib::{bsatn, ConnectionId, Identity, ProductValue, Timestamp};
 use spacetimedb_sats::{ProductType, WithTypespace};
 use spacetimedb_schema::def::ModuleDef;
@@ -590,7 +591,10 @@ where
             Session(Result<Event, UpstreamError>),
         }
         let row_types = self.row_types.clone();
-        let mut join = tokio::task::spawn_blocking(move || decode_seed_wait_frame(&frame, query_id, &row_types));
+        let mut join = tokio::task::spawn_blocking(move || {
+            deprioritize_mirror_background_thread();
+            decode_seed_wait_frame(&frame, query_id, &row_types)
+        });
         loop {
             let raw = tokio::select! {
                 biased;
