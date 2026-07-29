@@ -173,6 +173,18 @@ pub fn cli() -> clap::Command {
                 .value_parser(clap::value_parser!(usize))
                 .default_value("1"),
         )
+        .arg(
+            Arg::new("coordinator_socket")
+                .long("coordinator-socket")
+                .env("RELAY_COORDINATOR_SOCKET")
+                .help(
+                    "relay-coordinator Unix socket for cross-process subscribe serialization. \
+                     When set, this mirror acquires a reconnect permit before upstream \
+                     subscribe setup and releases it when live (same protocol as relay-bc*). \
+                     Empty = uncoordinated.",
+                )
+                .requires("public_mirror_v1"),
+        )
     // .after_help("Run `spacetime help start` for more detailed information.")
 }
 
@@ -334,10 +346,21 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
 
     if let Some(mirrors) = mirrors {
         let subscribe_gate = Arc::new(tokio::sync::Semaphore::new(mirror_subscribe_concurrency));
+        let coordinator_socket = args
+            .get_one::<String>("coordinator_socket")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
         log::info!(
             "public-mirror: subscribe concurrency gate = {mirror_subscribe_concurrency} \
              (slot held for the whole setup phase; released when the mirror goes live)"
         );
+        if let Some(ref path) = coordinator_socket {
+            log::info!(
+                "public-mirror: coordinator socket = {} (cross-process subscribe serialization)",
+                path.display()
+            );
+        }
         for m in &mirrors {
             bootstrap_public_mirror(
                 &ctx,
@@ -347,6 +370,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
                 mirror_tables.clone(),
                 reject_one_off_query,
                 Arc::clone(&subscribe_gate),
+                coordinator_socket.clone(),
             )
             .await
             .with_context(|| format!("failed to bootstrap public-mirror for `{}`", m.database))?;
@@ -675,6 +699,7 @@ async fn bootstrap_public_mirror(
     tables: Option<Vec<String>>,
     reject_one_off_query: bool,
     subscribe_gate: Arc<tokio::sync::Semaphore>,
+    coordinator_socket: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     log::info!("public-mirror: fetching schema for {mirror_database} from {upstream_url}");
     let (schema_bytes, module_def) = fetch_and_parse_schema(upstream_url, mirror_database)
@@ -784,7 +809,15 @@ async fn bootstrap_public_mirror(
         connect_timeout: Duration::from_secs(60),
     };
     tokio::spawn(async move {
-        if let Err(e) = run_public_mirror_loop(module_host, mirror_cfg, module_def, status, subscribe_gate).await
+        if let Err(e) = run_public_mirror_loop(
+            module_host,
+            mirror_cfg,
+            module_def,
+            status,
+            subscribe_gate,
+            coordinator_socket,
+        )
+        .await
         {
             log::error!("public-mirror upstream loop terminated: {e:#}");
         }

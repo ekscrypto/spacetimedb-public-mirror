@@ -1,10 +1,13 @@
 //! Upstream v1 BSATN client and apply loop for `--public-mirror-v1`.
 
 pub mod byte_count;
+pub mod coordinator_client;
 pub mod runtime;
 pub mod schema;
 pub mod status;
 pub mod upstream;
+
+pub use coordinator_client::{CoordinatorClient, CoordinatorPermit};
 
 pub use runtime::{run_public_mirror_loop, schema_program_hash, PublicMirrorConfig};
 pub use schema::{fetch_and_parse_schema, public_user_table_names, SchemaFetchError};

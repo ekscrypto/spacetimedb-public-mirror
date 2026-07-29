@@ -48,6 +48,7 @@ use tokio_tungstenite::{client_async_tls_with_config, WebSocketStream};
 use url::Url;
 
 use crate::byte_count::ByteCountStream;
+use crate::coordinator_client::CoordinatorPermit;
 use crate::status::{ByteCounter, MirrorStatusHandle, SeedApplyProgress};
 
 const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
@@ -222,6 +223,7 @@ pub async fn connect_and_mirror(
     failed_table: &mut Option<String>,
     status: MirrorStatusHandle,
     subscribe_permit: OwnedSemaphorePermit,
+    coordinator_permit: Option<CoordinatorPermit>,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     *failed_table = None;
@@ -287,7 +289,15 @@ pub async fn connect_and_mirror(
         deferred: VecDeque::new(),
     };
 
-    let result = mirror_session(&mut ctx, tables, live_started, failed_table, subscribe_permit).await;
+    let result = mirror_session(
+        &mut ctx,
+        tables,
+        live_started,
+        failed_table,
+        subscribe_permit,
+        coordinator_permit,
+    )
+    .await;
 
     // Apply whatever was already received and decoded before tearing down, so a
     // reconnect's re-seed starts from the freshest local state and the next
@@ -303,6 +313,7 @@ async fn mirror_session<S>(
     live_started: &mut Option<tokio::time::Instant>,
     failed_table: &mut Option<String>,
     subscribe_permit: OwnedSemaphorePermit,
+    coordinator_permit: Option<CoordinatorPermit>,
 ) -> Result<(), UpstreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -324,6 +335,7 @@ where
     // own setup. Live invariant: this session will not touch the gate again
     // until disconnect → reconnect (which waits disconnected).
     drop(subscribe_permit);
+    drop(coordinator_permit);
     ctx.status.set_live();
     *live_started = Some(tokio::time::Instant::now());
 

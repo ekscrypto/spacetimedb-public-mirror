@@ -1,6 +1,7 @@
 //! Public-mirror apply loop: upstream → `ModuleHost::apply_mirrored_updates`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +15,8 @@ use spacetimedb_primitives::TableId;
 use spacetimedb_schema::def::ModuleDef;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
+
+use crate::coordinator_client::CoordinatorClient;
 
 use crate::schema::public_user_table_names;
 use crate::status::MirrorStatusHandle;
@@ -98,6 +101,7 @@ pub async fn run_public_mirror_loop(
     module_def: ModuleDef,
     status: MirrorStatusHandle,
     subscribe_gate: Arc<Semaphore>,
+    coordinator_socket: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let tables = match config.tables {
         Some(t) if !t.is_empty() => t,
@@ -165,9 +169,17 @@ pub async fn run_public_mirror_loop(
     // slowest) seed while the connection is freshest, instead of after
     // re-seeding every other table first.
     let mut table_order = tables.clone();
+    let coordinator = coordinator_socket
+        .as_ref()
+        .map(|path| CoordinatorClient::new(path, config.database.clone()));
 
     loop {
-        let permit = acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
+        let coordinator_permit = match &coordinator {
+            Some(client) => client.acquire().await,
+            None => None,
+        };
+        let gate_permit =
+            acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
         let mut live_started = None;
         let mut failed_table = None;
         let result = upstream::connect_and_mirror(
@@ -178,7 +190,8 @@ pub async fn run_public_mirror_loop(
             &mut live_started,
             &mut failed_table,
             status.clone(),
-            permit,
+            gate_permit,
+            coordinator_permit,
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
