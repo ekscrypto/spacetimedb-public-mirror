@@ -13,7 +13,11 @@
 //!
 //! Apply ordering is preserved: the queue is FIFO, so everything received
 //! before a table's seed applies before it, and everything after applies
-//! after it.
+//! after it. Frames read while a large seed frame is decoding on the
+//! blocking pool are **deferred** (buffered, not applied) and replayed once
+//! the seed is enqueued — applying them eagerly would reorder post-snapshot
+//! updates ahead of the seed, whose truncate-then-insert would erase their
+//! effects and leave stale rows behind.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -279,6 +283,7 @@ pub async fn connect_and_mirror(
         on_update,
         status,
         counter,
+        deferred: VecDeque::new(),
     };
 
     let result = mirror_session(&mut ctx, tables, live_started, failed_table, subscribe_permit).await;
@@ -373,6 +378,11 @@ where
     );
     ctx.applier.maybe_start(&ctx.on_update, &ctx.status);
 
+    // Now that the seed is queued, replay frames that arrived while it was
+    // decoding off-thread. These are post-snapshot updates: applying them
+    // before the seed would let the truncate-and-seed erase their effects.
+    ctx.drain_deferred()?;
+
     // Wait for the seed apply to commit before subscribing the next table —
     // while continuing to read the socket, answer Pings, and apply interleaved
     // live TUs. The apply itself runs on the mirror's dedicated DB thread.
@@ -407,6 +417,13 @@ struct SessionCtx<S> {
     on_update: ApplyFn,
     status: MirrorStatusHandle,
     counter: ByteCounter,
+    /// Frames received while a large seed frame is decoding off-thread.
+    /// Applying them immediately would reorder them **ahead of the seed**
+    /// they arrived after (the truncate-and-seed then erases their effects,
+    /// leaving stale rows whose next update hits a unique-constraint
+    /// violation). They are replayed in arrival order once the decoded seed
+    /// (or non-seed message) has been routed.
+    deferred: VecDeque<Bytes>,
 }
 
 impl<S> SessionCtx<S>
@@ -539,11 +556,19 @@ where
                             tables_ops,
                             n_rows,
                             wire_bytes,
-                        } => return Ok((tables_ops, n_rows, wire_bytes)),
+                        } => {
+                            // Deferred frames are replayed by the caller,
+                            // *after* it enqueues this seed.
+                            return Ok((tables_ops, n_rows, wire_bytes));
+                        }
                         SeedWaitDecode::WrongQueryId { got, want } => {
                             log::warn!("public-mirror: unexpected SubscribeMultiApplied query_id={got} (want {want})");
+                            self.drain_deferred()?;
                         }
-                        SeedWaitDecode::Other(server) => self.route_background(server)?,
+                        SeedWaitDecode::Other(server) => {
+                            self.route_background(server)?;
+                            self.drain_deferred()?;
+                        }
                     }
                 }
                 Event::Applied | Event::Tick => {}
@@ -553,6 +578,12 @@ where
 
     /// Decompress + decode a large frame on the blocking pool while continuing
     /// to service the socket, Pings, and in-flight applies.
+    ///
+    /// **Ordering:** frames read while the decode is in flight arrived *after*
+    /// the frame being decoded, so they must apply after it. They are pushed
+    /// onto [`Self::deferred`] instead of being applied; the caller replays
+    /// them once the decoded message has been routed (for a seed, only after
+    /// the seed is enqueued).
     async fn decode_offloaded(&mut self, frame: Bytes, query_id: u32) -> Result<SeedWaitDecode, UpstreamError> {
         enum JoinEvent {
             Done(Result<Result<SeedWaitDecode, UpstreamError>, tokio::task::JoinError>),
@@ -572,11 +603,19 @@ where
                 }
                 JoinEvent::Session(ev) => {
                     if let Event::Frame(frame) = ev? {
-                        self.handle_background_frame(frame)?;
+                        self.deferred.push_back(frame);
                     }
                 }
             }
         }
+    }
+
+    /// Replay frames deferred during an offloaded decode, in arrival order.
+    fn drain_deferred(&mut self) -> Result<(), UpstreamError> {
+        while let Some(frame) = self.deferred.pop_front() {
+            self.handle_background_frame(frame)?;
+        }
+        Ok(())
     }
 
     /// Wait until the queued seed apply commits, servicing the socket and

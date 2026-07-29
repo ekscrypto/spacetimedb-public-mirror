@@ -87,7 +87,10 @@ must reacquire one (after backoff) before reconnecting, and shows `waiting`
 until it does.
 
 **WebSocket servicing is never blocked on database work.** The socket loop only
-reads, decodes, and enqueues; applies run from a FIFO queue whose in-flight job
+reads, decodes, and enqueues; applies run from a FIFO queue in strict arrival
+order — frames received while a large seed frame is decoding on the blocking
+pool are buffered and replayed after the seed is enqueued, so post-snapshot
+updates can never apply before the snapshot they follow. The in-flight job
 (on the mirror's dedicated JobCores thread) is polled *concurrently* with
 socket reads and Pings. A stuck or multi-minute insert costs queue depth (live
 backlog is capped at 1 GiB decoded — beyond that the session errors and
