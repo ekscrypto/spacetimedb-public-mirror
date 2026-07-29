@@ -700,12 +700,24 @@ async fn bootstrap_public_mirror(
     };
 
     let control = ctx.control_db();
-    let database_id = control
-        .insert_database(database.clone())
-        .context("failed to insert mirror database into control_db")?;
-    let mut database = control
-        .get_database_by_id(database_id)?
-        .context("mirror database missing after insert")?;
+    let (database_id, mut database) = match control.get_database_by_identity(&database_identity)? {
+        Some(existing) => {
+            log::info!(
+                "public-mirror: reusing existing control_db entry for `{mirror_database}` (database_id={})",
+                existing.id
+            );
+            (existing.id, existing)
+        }
+        None => {
+            let database_id = control
+                .insert_database(database.clone())
+                .context("failed to insert mirror database into control_db")?;
+            let database = control
+                .get_database_by_id(database_id)?
+                .context("mirror database missing after insert")?;
+            (database_id, database)
+        }
+    };
 
     // Ensure clients can connect by name.
     let domain = DatabaseName::from_str(mirror_database)
@@ -720,13 +732,29 @@ async fn bootstrap_public_mirror(
     }
 
     // Insert leader replica without triggering get_or_launch (which rejects HostType::Mirror).
-    let replica_id = control.insert_replica(Replica {
-        id: 0,
-        database_id,
-        node_id: 0,
-        leader: true,
-    })?;
-    log::info!("public-mirror: control_db database_id={database_id} replica_id={replica_id}");
+    let replica_id = match control
+        .get_replicas_by_database(database_id)?
+        .into_iter()
+        .find(|r| r.leader)
+    {
+        Some(existing) => {
+            log::info!(
+                "public-mirror: reusing existing leader replica for `{mirror_database}` (replica_id={})",
+                existing.id
+            );
+            existing.id
+        }
+        None => {
+            let replica_id = control.insert_replica(Replica {
+                id: 0,
+                database_id,
+                node_id: 0,
+                leader: true,
+            })?;
+            log::info!("public-mirror: control_db database_id={database_id} replica_id={replica_id}");
+            replica_id
+        }
+    };
 
     database.id = database_id;
     let module_host = ctx
