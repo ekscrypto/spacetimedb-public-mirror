@@ -13,6 +13,7 @@ use crate::subscription::module_subscription_actor::{commit_and_broadcast_event,
 use bytes::Bytes;
 use spacetimedb_client_api_messages::energy::FunctionBudget;
 use spacetimedb_datastore::execution_context::Workload;
+use spacetimedb_datastore::locking_tx_datastore::MutTxId;
 use spacetimedb_datastore::system_tables::ModuleKind;
 use spacetimedb_datastore::traits::{IsolationLevel, Program};
 use spacetimedb_execution::dml::MutDatastore;
@@ -70,77 +71,23 @@ impl SeedApplyProgress {
     }
 }
 
-/// Apply row ops in one mut tx and broadcast with upstream provenance.
-///
-/// When `is_seed` is set, each table is cleared before its snapshot rows are
-/// inserted. Reconnect re-seeds otherwise collide with rows left over from the
-/// previous session (unique constraint violation → endless reconnect loop).
-pub fn apply_external_update(
-    subs: &ModuleSubscriptions,
-    provenance: Option<ExternalProvenance>,
-    ops: impl IntoIterator<Item = TableOps>,
-    progress: Option<SeedApplyProgress>,
-    is_seed: bool,
-) -> Result<(), DBError> {
-    let stdb = subs.relational_db();
-    let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
+/// Rows committed per transaction during seed apply. Matches
+/// relay-mirror-driver's `max_rows_per_apply`: a multi-million-row table like
+/// `location_state` in one transaction keeps a giant in-memory tx state and
+/// defers all index work until a multi-minute final squash.
+const SEED_CHUNK_ROWS: usize = 4096;
 
-    // Yield / report periodically so a multi-million-row seed insert yields the
-    // dedicated JobCores thread under CPU contention, and so `/v1/mirrors`
-    // can show forward progress during `applying_seed`. (Other mirrors' live
-    // WS tasks run on the shared Tokio runtime + their own JobCores threads;
-    // they are not scheduled on this thread.)
-    const PROGRESS_EVERY: u64 = 50_000;
-    let mut total_applied = 0u64;
-    let mut since_tick = 0u64;
+/// Yield / report periodically so a multi-million-row seed insert yields the
+/// dedicated JobCores thread under CPU contention, and so `/v1/mirrors`
+/// can show forward progress during `applying_seed`.
+const PROGRESS_EVERY: u64 = 50_000;
 
-    for table_ops in ops {
-        if is_seed {
-            // Truncate-then-insert makes re-seeds idempotent. In the same mut-tx,
-            // unchanged rows cancel out (delete + identical insert), so downstream
-            // subscribers only see the actual diff against the previous session.
-            let removed = tx.clear_table(table_ops.table_id)?;
-            if removed > 0 {
-                log::info!(
-                    "public-mirror: cleared {removed} stale rows from table {} before re-seed",
-                    table_ops.table_id
-                );
-            }
-        }
-        for row in &table_ops.deletes {
-            tx.delete_product_value(table_ops.table_id, row)?;
-            total_applied += 1;
-            since_tick += 1;
-            if since_tick >= PROGRESS_EVERY {
-                if let Some(p) = &progress {
-                    p.record(total_applied);
-                }
-                std::thread::yield_now();
-                since_tick = 0;
-            }
-        }
-        for row_bytes in &table_ops.inserts {
-            stdb.insert(&mut tx, table_ops.table_id, row_bytes)?;
-            total_applied += 1;
-            since_tick += 1;
-            if since_tick >= PROGRESS_EVERY {
-                if let Some(p) = &progress {
-                    p.record(total_applied);
-                }
-                std::thread::yield_now();
-                since_tick = 0;
-            }
-        }
-    }
-    if let Some(p) = &progress {
-        p.record(total_applied);
-    }
-
+fn mirror_event(provenance: &Option<ExternalProvenance>) -> ModuleEvent {
     let (timestamp, caller_identity, caller_connection_id, request_id, function_call) = match provenance {
         Some(p) => {
             let reducer = match Identifier::new(p.reducer_name.clone().into()) {
                 Ok(id) => ReducerName::new(id),
-                Err(_) => ReducerName::new(Identifier::new_assume_valid(p.reducer_name.into())),
+                Err(_) => ReducerName::new(Identifier::new_assume_valid(p.reducer_name.clone().into())),
             };
             (
                 p.timestamp,
@@ -150,7 +97,7 @@ pub fn apply_external_update(
                 ModuleFunctionCall {
                     reducer: Some(reducer),
                     reducer_id: u32::MAX.into(),
-                    args: ArgsTuple::from_bsatn_unchecked(p.args),
+                    args: ArgsTuple::from_bsatn_unchecked(p.args.clone()),
                 },
             )
         }
@@ -163,7 +110,7 @@ pub fn apply_external_update(
         ),
     };
 
-    let event = ModuleEvent {
+    ModuleEvent {
         timestamp,
         caller_identity,
         caller_connection_id,
@@ -175,10 +122,104 @@ pub fn apply_external_update(
         host_execution_duration: Duration::ZERO,
         request_id,
         timer: None,
-    };
+    }
+}
 
+fn tick_apply_progress(
+    progress: &Option<SeedApplyProgress>,
+    total_applied: &mut u64,
+    since_tick: &mut u64,
+) {
+    *total_applied += 1;
+    *since_tick += 1;
+    if *since_tick >= PROGRESS_EVERY {
+        if let Some(p) = progress {
+            p.record(*total_applied);
+        }
+        std::thread::yield_now();
+        *since_tick = 0;
+    }
+}
+
+fn commit_mirror_tx(subs: &ModuleSubscriptions, event: ModuleEvent, tx: MutTxId) -> Result<(), DBError> {
     let _ = commit_and_broadcast_event(subs, None, event, tx);
     Ok(())
+}
+
+/// Apply row ops in one mut tx and broadcast with upstream provenance.
+///
+/// When `is_seed` is set, each table is cleared on the first chunk then rows
+/// are inserted in [`SEED_CHUNK_ROWS`] commits (same chunk size as
+/// relay-mirror-driver). Reconnect re-seeds otherwise collide with rows left
+/// over from the previous session (unique constraint violation → endless
+/// reconnect loop).
+pub fn apply_external_update(
+    subs: &ModuleSubscriptions,
+    provenance: Option<ExternalProvenance>,
+    ops: impl IntoIterator<Item = TableOps>,
+    progress: Option<SeedApplyProgress>,
+    is_seed: bool,
+) -> Result<(), DBError> {
+    let stdb = subs.relational_db();
+    let ops: Vec<TableOps> = ops.into_iter().collect();
+
+    if is_seed {
+        let event = mirror_event(&provenance);
+        let mut total_applied = 0u64;
+        let mut since_tick = 0u64;
+
+        for table_ops in ops {
+            let mut clear_first = true;
+            let mut chunk_start = 0usize;
+
+            while chunk_start <= table_ops.inserts.len() {
+                let chunk_end = (chunk_start + SEED_CHUNK_ROWS).min(table_ops.inserts.len());
+                let is_empty_seed = table_ops.inserts.is_empty() && clear_first;
+                if chunk_start == chunk_end && !is_empty_seed {
+                    break;
+                }
+
+                let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
+                if clear_first {
+                    let removed = tx.clear_table(table_ops.table_id)?;
+                    if removed > 0 {
+                        log::info!(
+                            "public-mirror: cleared {removed} stale rows from table {} before re-seed",
+                            table_ops.table_id
+                        );
+                    }
+                    clear_first = false;
+                }
+                for row_bytes in &table_ops.inserts[chunk_start..chunk_end] {
+                    stdb.insert(&mut tx, table_ops.table_id, row_bytes)?;
+                    tick_apply_progress(&progress, &mut total_applied, &mut since_tick);
+                }
+                commit_mirror_tx(subs, event.clone(), tx)?;
+
+                if is_empty_seed {
+                    break;
+                }
+                chunk_start = chunk_end;
+            }
+        }
+
+        if let Some(p) = &progress {
+            p.record(total_applied);
+        }
+        return Ok(());
+    }
+
+    let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
+    for table_ops in ops {
+        for row in &table_ops.deletes {
+            tx.delete_product_value(table_ops.table_id, row)?;
+        }
+        for row_bytes in &table_ops.inserts {
+            stdb.insert(&mut tx, table_ops.table_id, row_bytes)?;
+        }
+    }
+
+    commit_mirror_tx(subs, mirror_event(&provenance), tx)
 }
 
 /// Bootstrap user tables (and views) from a [`ModuleDef`] without running an init reducer.

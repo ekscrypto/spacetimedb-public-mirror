@@ -19,7 +19,7 @@
 //! updates ahead of the seed, whose truncate-then-insert would erase their
 //! effects and leave stale rows behind.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +41,7 @@ use spacetimedb_schema::def::ModuleDef;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{client_async_tls_with_config, WebSocketStream};
@@ -224,6 +224,7 @@ pub async fn connect_and_mirror(
     status: MirrorStatusHandle,
     subscribe_permit: OwnedSemaphorePermit,
     coordinator_permit: Option<CoordinatorPermit>,
+    completed_tables: Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     *failed_table = None;
@@ -296,6 +297,7 @@ pub async fn connect_and_mirror(
         failed_table,
         subscribe_permit,
         coordinator_permit,
+        completed_tables,
     )
     .await;
 
@@ -314,14 +316,27 @@ async fn mirror_session<S>(
     failed_table: &mut Option<String>,
     subscribe_permit: OwnedSemaphorePermit,
     coordinator_permit: Option<CoordinatorPermit>,
+    completed_tables: Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), UpstreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     ctx.await_identity_token().await?;
 
+    let already_done = completed_tables.lock().await.len();
+    if already_done > 0 {
+        log::info!(
+            "public-mirror: skipping {already_done} tables already seeded locally (reconnect resume)"
+        );
+        ctx.status
+            .set_table_live(u32::try_from(already_done).unwrap_or(u32::MAX));
+    }
+
     for (idx, table) in tables.iter().enumerate() {
-        if let Err(e) = subscribe_table(ctx, table, idx, tables.len()).await {
+        if completed_tables.lock().await.contains(table) {
+            continue;
+        }
+        if let Err(e) = subscribe_table(ctx, table, idx, tables.len(), &completed_tables).await {
             *failed_table = Some(table.clone());
             return Err(e);
         }
@@ -352,6 +367,7 @@ async fn subscribe_table<S>(
     table: &str,
     idx: usize,
     total: usize,
+    completed_tables: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), UpstreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -399,7 +415,9 @@ where
     // Wait for the seed apply to commit before subscribing the next table —
     // while continuing to read the socket, answer Pings, and apply interleaved
     // live TUs. The apply itself runs on the mirror's dedicated DB thread.
-    ctx.await_seed_applied().await
+    ctx.await_seed_applied().await?;
+    completed_tables.lock().await.insert(table.to_owned());
+    Ok(())
 }
 
 /// An event produced by [`SessionCtx::next_event`].

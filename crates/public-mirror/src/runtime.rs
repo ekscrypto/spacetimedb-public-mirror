@@ -1,6 +1,6 @@
 //! Public-mirror apply loop: upstream → `ModuleHost::apply_mirrored_updates`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -13,7 +13,7 @@ use spacetimedb::host::public_mirror::{ExternalProvenance, MirroredUpdate, Table
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_primitives::TableId;
 use spacetimedb_schema::def::ModuleDef;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::coordinator_client::CoordinatorClient;
@@ -169,6 +169,7 @@ pub async fn run_public_mirror_loop(
     // slowest) seed while the connection is freshest, instead of after
     // re-seeding every other table first.
     let mut table_order = tables.clone();
+    let completed_tables = Arc::new(Mutex::new(HashSet::new()));
     let coordinator = coordinator_socket
         .as_ref()
         .map(|path| CoordinatorClient::new(path, config.database.clone()));
@@ -192,6 +193,7 @@ pub async fn run_public_mirror_loop(
             status.clone(),
             gate_permit,
             coordinator_permit,
+            Arc::clone(&completed_tables),
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
