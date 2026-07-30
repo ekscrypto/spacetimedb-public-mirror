@@ -113,6 +113,12 @@ large-shard wire seeds.
 Per-mirror connectivity (waiting / connecting / subscribing / live / disconnected),
 table sync progress, transaction counts, and reconnect ETA are exposed at
 `GET /v1/mirrors` (JSON, unauthenticated — same posture as `/v1/metrics`).
+
+In `--public-mirror-v1` mode an **isolated sidecar listener** also serves the
+same JSON at `127.0.0.1:<main-port+1>/v1/mirrors` (e.g. main `:3000` → status
+`:3001`, trial main `:3030` → status `:3031`). Poll the sidecar for readiness
+during large-table seed — the main HTTP port may not respond until seed apply
+finishes. Override with `--mirror-status-listen-addr`.
 While `subscribing`, the response also includes the current table name/phase,
 socket bytes received since that subscribe started, and `last_byte_at` so you
 can tell a slowly arriving seed from a hung connection. During `applying_seed`,

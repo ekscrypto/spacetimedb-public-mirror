@@ -1,4 +1,5 @@
 pub(crate) mod control_db;
+pub(crate) mod mirror_status_server;
 pub mod subcommands;
 pub mod util;
 pub mod version;

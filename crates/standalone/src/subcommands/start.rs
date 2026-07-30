@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use crate::mirror_status_server;
 use crate::{StandaloneEnv, StandaloneOptions};
 use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
@@ -185,6 +186,16 @@ pub fn cli() -> clap::Command {
                 )
                 .requires("public_mirror_v1"),
         )
+        .arg(
+            Arg::new("mirror_status_listen_addr")
+                .long("mirror-status-listen-addr")
+                .help(
+                    "Loopback address for an isolated GET /v1/mirrors listener \
+                     (default in public-mirror-v1 mode: 127.0.0.1:<main-port+1>). \
+                     Stays responsive while the main server is seeding large tables.",
+                )
+                .requires("public_mirror_v1"),
+        )
     // .after_help("Run `spacetime help start` for more detailed information.")
 }
 
@@ -344,6 +355,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     worker_metrics::spawn_page_pool_stats(listen_addr.clone(), ctx.page_pool().clone());
     worker_metrics::spawn_bsatn_rlb_pool_stats(listen_addr.clone(), ctx.bsatn_rlb_pool().clone());
 
+    let mirror_mode = mirrors.is_some();
     if let Some(mirrors) = mirrors {
         let subscribe_gate = Arc::new(tokio::sync::Semaphore::new(mirror_subscribe_concurrency));
         let coordinator_socket = args
@@ -430,6 +442,20 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     } else {
         listen_addr.to_string()
     };
+
+    if mirror_mode {
+        let status_addr = args
+            .get_one::<String>("mirror_status_listen_addr")
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .trim();
+        let status_listen = if status_addr.is_empty() {
+            mirror_status_server::default_listen_addr(&listen_addr)?
+        } else {
+            status_addr.to_string()
+        };
+        mirror_status_server::spawn(Arc::clone(ctx.mirror_status_registry()), status_listen);
+    }
 
     let tcp = TcpListener::bind(&listen_addr).await.context(format!(
         "failed to bind the SpacetimeDB server to '{listen_addr}', please check that the address is valid and not already in use"
