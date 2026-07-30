@@ -12,7 +12,12 @@ use axum::{Json, Router};
 use spacetimedb_public_mirror_client::MirrorStatusRegistry;
 use tokio::net::TcpListener;
 
-/// Default sidecar bind: loopback, main listen port + 1.
+/// Sidecar offset from the main listen port. Status HTTP stays off the
+/// per-region public band (`3000 + N`) so adjacent native-port instances
+/// do not collide (e.g. region 7 main `:3007`, sidecar `:3037`).
+pub const MIRROR_STATUS_PORT_OFFSET: u16 = 30;
+
+/// Default sidecar bind: loopback, main listen port + [`MIRROR_STATUS_PORT_OFFSET`].
 pub fn default_listen_addr(main_listen: &str) -> anyhow::Result<String> {
     let (_host, port_str) = main_listen
         .rsplit_once(':')
@@ -20,9 +25,9 @@ pub fn default_listen_addr(main_listen: &str) -> anyhow::Result<String> {
     let port: u16 = port_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid port in listen-addr `{main_listen}`"))?;
-    let status_port = port
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("mirror status port overflow (main port 65535)"))?;
+    let status_port = port.checked_add(MIRROR_STATUS_PORT_OFFSET).ok_or_else(|| {
+        anyhow::anyhow!("mirror status port overflow (main port {port} + {MIRROR_STATUS_PORT_OFFSET})")
+    })?;
     Ok(format!("127.0.0.1:{status_port}"))
 }
 
@@ -73,14 +78,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_listen_addr_is_loopback_port_plus_one() {
+    fn default_listen_addr_is_loopback_port_plus_offset() {
         assert_eq!(
             default_listen_addr("127.0.0.1:3030").unwrap(),
-            "127.0.0.1:3031"
+            "127.0.0.1:3060"
         );
         assert_eq!(
             default_listen_addr("0.0.0.0:3000").unwrap(),
-            "127.0.0.1:3001"
+            "127.0.0.1:3030"
+        );
+        assert_eq!(
+            default_listen_addr("127.0.0.1:3007").unwrap(),
+            "127.0.0.1:3037"
         );
     }
 }

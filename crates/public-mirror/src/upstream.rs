@@ -11,13 +11,16 @@
 //! answered, and reads keep draining the kernel buffer so upstream never sees
 //! a slow consumer.
 //!
-//! Apply ordering is preserved: the queue is FIFO, so everything received
-//! before a table's seed applies before it, and everything after applies
-//! after it. Frames read while a large seed frame is decoding on the
-//! blocking pool are **deferred** (buffered, not applied) and replayed once
-//! the seed is enqueued — applying them eagerly would reorder post-snapshot
-//! updates ahead of the seed, whose truncate-then-insert would erase their
-//! effects and leave stale rows behind.
+//! Apply ordering is preserved: the queue is strictly FIFO — seeds and live
+//! updates apply in arrival order. During initial subscribe, wire seeds are
+//! queued as they arrive and the next table's `SubscribeMulti` is sent
+//! immediately (same pipelining as relay sequential mode); local apply
+//! catches up on the dedicated DB thread while upstream keeps sending.
+//! Frames read while a large seed frame is decoding on the blocking pool are
+//! **deferred** (buffered, not applied) and replayed once the seed is enqueued
+//! — applying them eagerly would reorder post-snapshot updates ahead of the
+//! seed, whose truncate-then-insert would erase their effects and leave stale
+//! rows behind.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -80,10 +83,10 @@ const IDENTITY_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 const OFFLOAD_DECODE_BYTES: usize = 256 * 1024;
 
 /// Cap on decoded-but-unapplied *live* update bytes queued in memory. Seeds are
-/// excluded: only one seed is in flight at a time by construction, and its size
-/// is dictated by the upstream table. If live traffic outruns the local apply
-/// rate for long enough to hit this, the session errors (and reconnects) instead
-/// of growing without bound.
+/// excluded from this cap: their size is dictated by upstream and they queue in
+/// FIFO order during pipelined subscribe. If live traffic outruns the local
+/// apply rate for long enough to hit this, the session errors (and reconnects)
+/// instead of growing without bound.
 const LIVE_QUEUE_BYTES_MAX: usize = 1024 * 1024 * 1024;
 
 /// Max live updates applied in one database job. Batching amortizes the
@@ -203,11 +206,11 @@ type ApplyFn = Arc<
 /// connection is freshest) on the next attempt.
 ///
 /// `subscribe_permit` is the subscribe-gate slot acquired by the caller before
-/// connecting. It is held for the **entire setup phase** — connect, every
-/// table's wire seed, and every local seed apply — and released only when the
-/// session goes live, so exactly one mirror sets up mirroring at a time. On
-/// failure the permit is dropped by RAII when this function returns, letting
-/// the next waiting mirror proceed.
+/// connecting. It is held through connect and every table's **wire** seed
+/// (SubscribeMultiApplied received and enqueued); released once all tables are
+/// subscribed on the wire so the next mirror can start downloading while this
+/// one drains its FIFO apply queue. Local seed applies continue on the dedicated
+/// DB thread after the gate is released.
 ///
 /// **Live invariant:** once this session reaches `status.set_live()`, it never
 /// reacquires the gate until disconnect. Another mirror's subscribe/seed must not
@@ -336,38 +339,39 @@ where
         if completed_tables.lock().await.contains(table) {
             continue;
         }
-        if let Err(e) = subscribe_table(ctx, table, idx, tables.len(), &completed_tables).await {
+        if let Err(e) = subscribe_table(ctx, table, idx, tables.len()).await {
             *failed_table = Some(table.clone());
             return Err(e);
         }
     }
 
+    // All wire seeds received — release the gate so another mirror can start
+    // downloading while this session drains its FIFO apply queue.
+    drop(subscribe_permit);
+    drop(coordinator_permit);
+
+    await_all_seeds_applied(ctx, &completed_tables).await?;
+
     log::info!(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
     );
-    // Setup is complete: release the gate so the next mirror can start its
-    // own setup. Live invariant: this session will not touch the gate again
-    // until disconnect → reconnect (which waits disconnected).
-    drop(subscribe_permit);
-    drop(coordinator_permit);
     ctx.status.set_live();
     *live_started = Some(tokio::time::Instant::now());
 
     ctx.live_loop().await
 }
 
-/// Subscribe one table: send `SubscribeMulti`, await the seed snapshot, then
-/// enqueue it and wait for the local apply to finish.
+/// Subscribe one table: send `SubscribeMulti`, await the wire seed snapshot,
+/// enqueue it for FIFO apply, and return — **without** waiting for local apply.
 ///
-/// The caller holds the subscribe-gate permit for the whole setup phase, so
-/// this function never touches the gate.
+/// The next table's subscribe is sent while prior seeds drain from the apply
+/// queue. Ordering is preserved because [`Applier`] is strictly FIFO.
 async fn subscribe_table<S>(
     ctx: &mut SessionCtx<S>,
     table: &str,
     idx: usize,
     total: usize,
-    completed_tables: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), UpstreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -397,6 +401,7 @@ where
         });
     }
     ctx.applier.enqueue_seed(
+        table.to_owned(),
         UpstreamUpdate {
             provenance: None,
             tables: tables_ops,
@@ -412,11 +417,26 @@ where
     // before the seed would let the truncate-and-seed erase their effects.
     ctx.drain_deferred()?;
 
-    // Wait for the seed apply to commit before subscribing the next table —
-    // while continuing to read the socket, answer Pings, and apply interleaved
-    // live TUs. The apply itself runs on the mirror's dedicated DB thread.
-    ctx.await_seed_applied().await?;
-    completed_tables.lock().await.insert(table.to_owned());
+    Ok(())
+}
+
+/// Wait until every enqueued seed has committed locally, servicing the socket
+/// and interleaved live TUs the whole time.
+async fn await_all_seeds_applied<S>(
+    ctx: &mut SessionCtx<S>,
+    completed_tables: &Arc<Mutex<HashSet<String>>>,
+) -> Result<(), UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    while ctx.applier.has_pending_seeds() {
+        match ctx.next_event().await? {
+            Event::Frame(frame) => ctx.handle_background_frame(frame)?,
+            Event::Applied => ctx.flush_completed_seeds(completed_tables).await,
+            Event::Tick => {}
+        }
+    }
+    ctx.flush_completed_seeds(completed_tables).await;
     Ok(())
 }
 
@@ -526,6 +546,13 @@ where
         self.applier.enqueue_live(update)?;
         self.applier.maybe_start(&self.on_update, &self.status);
         Ok(())
+    }
+
+    /// Move completed seed table names into `completed_tables` (reconnect resume).
+    async fn flush_completed_seeds(&mut self, completed_tables: &Arc<Mutex<HashSet<String>>>) {
+        for table in self.applier.drain_completed_seed_tables() {
+            completed_tables.lock().await.insert(table);
+        }
     }
 
     /// Wait for the post-connect `IdentityToken` (bounded by
@@ -652,17 +679,6 @@ where
         Ok(())
     }
 
-    /// Wait until the queued seed apply commits, servicing the socket and
-    /// interleaved live TUs the whole time.
-    async fn await_seed_applied(&mut self) -> Result<(), UpstreamError> {
-        while self.applier.seed_pending {
-            if let Event::Frame(frame) = self.next_event().await? {
-                self.handle_background_frame(frame)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Live update loop — read, decode, enqueue; applies complete concurrently.
     async fn live_loop(&mut self) -> Result<(), UpstreamError> {
         loop {
@@ -742,30 +758,37 @@ enum ApplyKind {
     /// One live update; `transactions` is 1 for a provenance-carrying TU.
     Live { transactions: u64 },
     /// A table seed snapshot (applied alone, with progress reporting).
-    Seed { seed_rows: u64, table_number: u32 },
+    Seed {
+        table_name: String,
+        seed_rows: u64,
+        table_number: u32,
+    },
 }
 
 /// A batch of updates currently executing on the mirror's DB thread.
 struct InFlightApply {
     fut: BoxFuture<'static, Result<(), anyhow::Error>>,
     transactions: u64,
+    seed_table_name: Option<String>,
     seed_table_number: Option<u32>,
     cost: usize,
 }
 
 /// FIFO apply queue + the single in-flight apply job.
 ///
-/// Ordering: strictly arrival order. Seeds run alone; consecutive live updates
-/// are batched (up to [`APPLY_BATCH_MAX`]) into one DB job to amortize the
-/// cross-thread round trip when a backlog has built up.
+/// Ordering: strictly arrival order. Seeds run alone (one DB job per table);
+/// consecutive live updates are batched (up to [`APPLY_BATCH_MAX`]) into one DB
+/// job to amortize the cross-thread round trip when a backlog has built up.
+/// During pipelined subscribe, multiple seeds may queue while upstream keeps
+/// sending; they still apply in table order.
 #[derive(Default)]
 struct Applier {
     queue: VecDeque<PendingApply>,
     /// Approximate bytes of queued + in-flight *live* updates.
     queued_live_bytes: usize,
     in_flight: Option<InFlightApply>,
-    /// A seed has been enqueued and has not finished applying.
-    seed_pending: bool,
+    /// Seed table names whose apply jobs have finished (FIFO drain).
+    completed_seed_tables: VecDeque<String>,
 }
 
 impl Applier {
@@ -787,16 +810,39 @@ impl Applier {
         Ok(())
     }
 
-    fn enqueue_seed(&mut self, update: UpstreamUpdate, seed_rows: u64, table_number: u32) {
-        self.seed_pending = true;
+    fn enqueue_seed(
+        &mut self,
+        table_name: String,
+        update: UpstreamUpdate,
+        seed_rows: u64,
+        table_number: u32,
+    ) {
         self.queue.push_back(PendingApply {
             update,
             kind: ApplyKind::Seed {
+                table_name,
                 seed_rows,
                 table_number,
             },
             cost: 0,
         });
+    }
+
+    fn has_pending_seeds(&self) -> bool {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.seed_table_number.is_some())
+        {
+            return true;
+        }
+        self.queue
+            .iter()
+            .any(|p| matches!(p.kind, ApplyKind::Seed { .. }))
+    }
+
+    fn drain_completed_seed_tables(&mut self) -> Vec<String> {
+        self.completed_seed_tables.drain(..).collect()
     }
 
     /// Start the next apply job if none is in flight.
@@ -807,17 +853,22 @@ impl Applier {
         let Some(front) = self.queue.front() else {
             return;
         };
-        if let ApplyKind::Seed {
-            seed_rows,
-            table_number,
-        } = front.kind
-        {
+        if matches!(front.kind, ApplyKind::Seed { .. }) {
             let pending = self.queue.pop_front().expect("front checked above");
+            let ApplyKind::Seed {
+                table_name,
+                seed_rows,
+                table_number,
+            } = pending.kind
+            else {
+                unreachable!("seed front");
+            };
             let progress = status.set_applying_seed(seed_rows);
             let fut = on_update(vec![pending.update], Some(progress));
             self.in_flight = Some(InFlightApply {
                 fut,
                 transactions: 0,
+                seed_table_name: Some(table_name),
                 seed_table_number: Some(table_number),
                 cost: pending.cost,
             });
@@ -844,6 +895,7 @@ impl Applier {
         self.in_flight = Some(InFlightApply {
             fut,
             transactions,
+            seed_table_name: None,
             seed_table_number: None,
             cost,
         });
@@ -857,15 +909,15 @@ impl Applier {
     ) -> Result<(), UpstreamError> {
         let done = self.in_flight.take().expect("finish_in_flight without in-flight apply");
         self.queued_live_bytes = self.queued_live_bytes.saturating_sub(done.cost);
-        if done.seed_table_number.is_some() {
-            self.seed_pending = false;
-        }
         result.map_err(|e| UpstreamError::Apply(format!("{e:#}")))?;
         if done.transactions > 0 {
             status.inc_transactions_by(done.transactions);
         }
         if let Some(table_number) = done.seed_table_number {
             status.set_table_live(table_number);
+            if let Some(table_name) = done.seed_table_name {
+                self.completed_seed_tables.push_back(table_name);
+            }
         }
         Ok(())
     }
@@ -1247,6 +1299,7 @@ mod tests {
             applier.enqueue_live(live_update(true, 8)).unwrap();
         }
         applier.enqueue_seed(
+            "seed_table".into(),
             UpstreamUpdate {
                 provenance: None,
                 tables: Vec::new(),
@@ -1268,12 +1321,16 @@ mod tests {
         assert_eq!(applied.load(Ordering::SeqCst), 5);
 
         // Job 2: the seed, alone.
-        assert!(applier.seed_pending);
+        assert!(applier.has_pending_seeds());
         applier.maybe_start(&on_update, &status);
         assert!(applier.in_flight.as_ref().unwrap().seed_table_number == Some(1));
         let result = applier.in_flight.as_mut().unwrap().fut.as_mut().await;
         applier.finish_in_flight(result, &status).unwrap();
-        assert!(!applier.seed_pending);
+        assert!(!applier.has_pending_seeds());
+        assert_eq!(
+            applier.drain_completed_seed_tables(),
+            vec!["seed_table".to_string()]
+        );
         assert_eq!(applied.load(Ordering::SeqCst), 6);
 
         // Job 3: the trailing live updates.
@@ -1283,6 +1340,37 @@ mod tests {
         assert_eq!(applied.load(Ordering::SeqCst), 9);
         assert!(applier.queue.is_empty());
         assert_eq!(applier.queued_live_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn applier_tracks_multiple_pending_seeds_in_fifo_order() {
+        let status = test_status();
+        let on_update = counting_apply(Arc::new(AtomicUsize::new(0)));
+        let mut applier = Applier::default();
+
+        for (name, n) in [("t_a", 1u32), ("t_b", 2), ("t_c", 3)] {
+            applier.enqueue_seed(
+                name.into(),
+                UpstreamUpdate {
+                    provenance: None,
+                    tables: Vec::new(),
+                    is_seed: true,
+                },
+                0,
+                n,
+            );
+        }
+        assert!(applier.has_pending_seeds());
+
+        let mut finished = Vec::new();
+        for _ in 0..3 {
+            applier.maybe_start(&on_update, &status);
+            let result = applier.in_flight.as_mut().unwrap().fut.as_mut().await;
+            applier.finish_in_flight(result, &status).unwrap();
+            finished.extend(applier.drain_completed_seed_tables());
+        }
+        assert!(!applier.has_pending_seeds());
+        assert_eq!(finished, vec!["t_a", "t_b", "t_c"]);
     }
 
     #[test]
