@@ -52,6 +52,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 
 use crate::auth::SpacetimeAuth;
+use crate::routes::mirrors::{public_mirror_accepts_clients, MirrorConnectivity};
 use crate::util::serde::humantime_duration;
 use crate::util::websocket::{
     CloseCode, CloseFrame, Message as WsMessage, WebSocketConfig, WebSocketStream, WebSocketUpgrade, WsError,
@@ -147,6 +148,33 @@ where
     }
 
     let db_identity = name_or_identity.resolve(&ctx).await?;
+
+    // Public-mirror: reject WS clients until the mirror is fully live. Status
+    // remains available on the isolated GET /v1/mirrors sidecar.
+    let mirror_statuses = ctx.mirror_statuses();
+    if !public_mirror_accepts_clients(&mirror_statuses) {
+        let detail = mirror_statuses
+            .mirrors
+            .iter()
+            .map(|m| {
+                let conn = match m.connectivity {
+                    MirrorConnectivity::Waiting => "waiting",
+                    MirrorConnectivity::Connecting => "connecting",
+                    MirrorConnectivity::Subscribing => "subscribing",
+                    MirrorConnectivity::Live => "live",
+                    MirrorConnectivity::Disconnected => "disconnected",
+                };
+                format!("{}={conn} {}/{}", m.database, m.tables_live, m.tables_total)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        record_client_rejection(db_identity, ClientRejectCause::AuthorizationFailed);
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("public-mirror not ready for clients yet ({detail}); poll GET /v1/mirrors"),
+        ))?;
+    }
+
     let sql_auth = match ctx.authorize_sql(auth.claims.identity, db_identity).await {
         Ok(sql_auth) => sql_auth,
         Err(err) => {

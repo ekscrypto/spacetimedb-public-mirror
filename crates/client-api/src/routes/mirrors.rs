@@ -75,10 +75,71 @@ pub async fn mirrors<S: NodeDelegate>(State(ctx): State<S>) -> impl IntoResponse
     Json(ctx.mirror_statuses())
 }
 
+/// Whether downstream clients may connect to this node.
+///
+/// Non-mirror deployments (empty `/v1/mirrors` registry) always accept clients.
+/// In `--public-mirror-v1` mode, clients are rejected until every mirrored
+/// database reports [`MirrorConnectivity::Live`] — so seed apply can skip
+/// subscription eval / broadcast with no risk of missing updates. Status
+/// polling via `GET /v1/mirrors` is unaffected.
+pub fn public_mirror_accepts_clients(statuses: &MirrorsResponse) -> bool {
+    let mirrors = &statuses.mirrors;
+    mirrors.is_empty() || mirrors.iter().all(|m| m.connectivity == MirrorConnectivity::Live)
+}
+
 pub fn router<S>() -> axum::Router<S>
 where
     S: NodeDelegate + Clone + 'static,
 {
     use axum::routing::get;
     axum::Router::new().route("/", get(mirrors::<S>))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(connectivity: MirrorConnectivity) -> MirrorStatusSnapshot {
+        MirrorStatusSnapshot {
+            host: "h".into(),
+            database: "db".into(),
+            connectivity,
+            connected_since: None,
+            disconnected_since: None,
+            next_attempt_at: None,
+            next_attempt_eta_secs: None,
+            tables_live: 0,
+            tables_total: 1,
+            transactions_processed: 0,
+            current_table: None,
+            current_table_started_at: None,
+            current_table_phase: None,
+            current_table_bytes_received: None,
+            last_byte_at: None,
+            current_table_seed_rows: None,
+            current_table_seed_rows_applied: None,
+            last_seed_apply_at: None,
+        }
+    }
+
+    #[test]
+    fn accepts_clients_when_not_mirroring() {
+        assert!(public_mirror_accepts_clients(&MirrorsResponse::default()));
+    }
+
+    #[test]
+    fn rejects_clients_until_all_mirrors_live() {
+        let statuses = MirrorsResponse {
+            mirrors: vec![
+                snap(MirrorConnectivity::Live),
+                snap(MirrorConnectivity::Subscribing),
+            ],
+        };
+        assert!(!public_mirror_accepts_clients(&statuses));
+
+        let statuses = MirrorsResponse {
+            mirrors: vec![snap(MirrorConnectivity::Live), snap(MirrorConnectivity::Live)],
+        };
+        assert!(public_mirror_accepts_clients(&statuses));
+    }
 }

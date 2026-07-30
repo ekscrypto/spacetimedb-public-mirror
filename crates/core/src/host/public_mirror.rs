@@ -141,18 +141,30 @@ fn tick_apply_progress(
     }
 }
 
-fn commit_mirror_tx(subs: &ModuleSubscriptions, event: ModuleEvent, tx: MutTxId) -> Result<(), DBError> {
+/// Commit a seed chunk without subscription eval / client broadcast.
+///
+/// Downstream clients are rejected until the mirror is `live`, so seed commits
+/// can skip `commit_and_broadcast_event` (no `from_writes`, no
+/// `eval_updates_sequential`). Clients that connect after `set_live` get a
+/// fresh InitialSubscription from current state.
+fn commit_seed_tx(subs: &ModuleSubscriptions, tx: MutTxId) -> Result<(), DBError> {
+    let _ = subs.relational_db().commit_tx(tx)?;
+    Ok(())
+}
+
+fn commit_live_tx(subs: &ModuleSubscriptions, event: ModuleEvent, tx: MutTxId) -> Result<(), DBError> {
     let _ = commit_and_broadcast_event(subs, None, event, tx);
     Ok(())
 }
 
-/// Apply row ops in one mut tx and broadcast with upstream provenance.
+/// Apply row ops in one mut tx and (for live updates) broadcast with upstream provenance.
 ///
 /// When `is_seed` is set, each table is cleared on the first chunk then rows
 /// are inserted in [`SEED_CHUNK_ROWS`] commits (same chunk size as
-/// relay-mirror-driver). Reconnect re-seeds otherwise collide with rows left
-/// over from the previous session (unique constraint violation → endless
-/// reconnect loop).
+/// relay-mirror-driver). Seed commits intentionally skip subscription
+/// evaluation — clients are not accepted until the mirror is fully live.
+/// Reconnect re-seeds otherwise collide with rows left over from the previous
+/// session (unique constraint violation → endless reconnect loop).
 pub fn apply_external_update(
     subs: &ModuleSubscriptions,
     provenance: Option<ExternalProvenance>,
@@ -164,7 +176,6 @@ pub fn apply_external_update(
     let ops: Vec<TableOps> = ops.into_iter().collect();
 
     if is_seed {
-        let event = mirror_event(&provenance);
         let mut total_applied = 0u64;
         let mut since_tick = 0u64;
 
@@ -194,7 +205,7 @@ pub fn apply_external_update(
                     stdb.insert(&mut tx, table_ops.table_id, row_bytes)?;
                     tick_apply_progress(&progress, &mut total_applied, &mut since_tick);
                 }
-                commit_mirror_tx(subs, event.clone(), tx)?;
+                commit_seed_tx(subs, tx)?;
 
                 if is_empty_seed {
                     break;
@@ -219,7 +230,7 @@ pub fn apply_external_update(
         }
     }
 
-    commit_mirror_tx(subs, mirror_event(&provenance), tx)
+    commit_live_tx(subs, mirror_event(&provenance), tx)
 }
 
 /// Bootstrap user tables (and views) from a [`ModuleDef`] without running an init reducer.
