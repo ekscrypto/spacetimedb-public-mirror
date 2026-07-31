@@ -356,6 +356,7 @@ impl MirrorStatusHandle {
             s.connected_since = None;
             s.disconnected_since = Some(now);
             s.next_attempt_at = Some(next_attempt_at);
+            s.tables_live = 0;
             s.clear_current_table();
             s.byte_counter = None;
         });

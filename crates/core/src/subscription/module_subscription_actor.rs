@@ -1726,6 +1726,22 @@ impl ModuleSubscriptions {
         }
     }
 
+    /// Abort every downstream WebSocket client and clear subscription state.
+    ///
+    /// Used by `--public-mirror-v1` on upstream reconnect so clients never
+    /// observe a truncated re-seed. Returns the number of clients kicked.
+    pub fn kick_all_subscribers(&self) -> usize {
+        let senders = {
+            let mut subscriptions = self.subscriptions.write();
+            subscriptions.take_all_client_senders()
+        };
+        let n = senders.len();
+        for sender in senders {
+            sender.kick();
+        }
+        n
+    }
+
     /// Rolls back `tx` and returns the offset as it was before `tx`.
     pub(crate) fn rollback_mut_tx(stdb: &RelationalDB, tx: MutTxId) -> TxOffset {
         let (tx_offset, tx_metrics, reducer) = stdb.rollback_mut_tx(tx);

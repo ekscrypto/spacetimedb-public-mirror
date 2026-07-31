@@ -90,11 +90,13 @@ fn update_to_mirrored(update: UpstreamUpdate, table_ids: &HashMap<String, TableI
 /// [`ModuleHost::apply_mirrored_updates`], matching SpacetimeDB's one-thread-per-database
 /// model while amortizing the cross-thread round trip when a backlog has built up.
 ///
-/// `subscribe_gate` serialises the whole setup phase across mirrors: a permit is
-/// acquired before connecting and held through every table's wire seed and local
-/// apply, released only when the mirror goes live. A live mirror never touches
-/// the gate again until it disconnects, at which point it must reacquire a
-/// permit (after backoff) before reconnecting.
+/// `subscribe_gate` serialises the **setup** phase across mirrors: a permit is
+/// acquired before connecting and held through every table's wire seed
+/// (`SubscribeMultiApplied` received and enqueued); released so the next mirror
+/// can start downloading while this one drains local apply. On disconnect the
+/// loop cold-resets (kick clients, flush tables) then must reacquire the gate
+/// (and coordinator permit) before reconnecting — so a fleet-wide blip does not
+/// stampede all regions' re-seeds at once.
 pub async fn run_public_mirror_loop(
     module_host: ModuleHost,
     config: PublicMirrorConfig,
@@ -120,6 +122,8 @@ pub async fn run_public_mirror_loop(
 
     let stdb = module_host.relational_db().clone();
     let table_ids = resolve_table_ids(&stdb, &tables)?;
+    let flush_table_ids: Vec<TableId> = table_ids.values().copied().collect();
+    let module_for_reset = module_host.clone();
 
     let on_update = Arc::new(
         move |updates: Vec<UpstreamUpdate>,
@@ -175,6 +179,8 @@ pub async fn run_public_mirror_loop(
         .map(|path| CoordinatorClient::new(path, config.database.clone()));
 
     loop {
+        // Gate + coordinator: serialise re-seeds so a shared upstream blip
+        // cannot pull every region through SubscribeMulti at once.
         let coordinator_permit = match &coordinator {
             Some(client) => client.acquire().await,
             None => None,
@@ -202,18 +208,30 @@ pub async fn run_public_mirror_loop(
         }
         let sleep_for = Duration::from_secs(backoff_secs);
         let next_attempt_at = SystemTime::now() + sleep_for;
+        // Mark disconnected first so `public_mirror_accepts_clients` rejects
+        // new WS until this (and every) mirror is live again.
         status.set_disconnected(next_attempt_at);
         match result {
             Ok(()) => {
                 log::warn!(
-                    "public-mirror: upstream loop exited cleanly; reconnecting in {backoff_secs}s (lived {lived_for:?})"
+                    "public-mirror: upstream loop exited cleanly; cold-reset then reconnect in {backoff_secs}s (lived {lived_for:?})"
                 );
             }
             Err(e) => {
                 log::error!(
-                    "public-mirror: upstream error: {e:#}; reconnecting in {backoff_secs}s (lived {lived_for:?})"
+                    "public-mirror: upstream error: {e:#}; cold-reset then reconnect in {backoff_secs}s (lived {lived_for:?})"
                 );
             }
+        }
+        // Treat the next attempt as a brand-new mirror: drop subscribers,
+        // truncate local tables, forget prior seed progress. Re-subscribe goes
+        // through the gate above after backoff.
+        completed_tables.lock().await.clear();
+        if let Err(e) = module_for_reset
+            .reset_mirror_for_reconnect(flush_table_ids.iter().copied())
+            .await
+        {
+            log::error!("public-mirror: reconnect cold-reset failed: {e:#}");
         }
         if let Some(failed) = failed_table
             && let Some(pos) = table_order.iter().position(|t| *t == failed)

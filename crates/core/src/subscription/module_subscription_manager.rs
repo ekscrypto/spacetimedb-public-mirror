@@ -1197,6 +1197,23 @@ impl SubscriptionManager {
         }
     }
 
+    /// Drain every registered client sender (for public-mirror reconnect reset).
+    ///
+    /// Callers must [`ClientConnectionSender::kick`] each returned handle after
+    /// dropping the manager lock. Subscription state is cleared via
+    /// [`Self::remove_all_subscriptions`] for each client.
+    pub fn take_all_client_senders(&mut self) -> Vec<Client> {
+        let ids: Vec<ClientId> = self.clients.keys().copied().collect();
+        let mut senders = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(info) = self.clients.get(&id) {
+                senders.push(info.outbound_ref.clone());
+            }
+            let _ = self.remove_all_subscriptions(&id);
+        }
+        senders
+    }
+
     /// Removes a client from the subscriber mapping.
     /// If a query no longer has any subscribers,
     /// it is removed from the index along with its table ids.

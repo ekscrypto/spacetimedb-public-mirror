@@ -407,6 +407,16 @@ impl ClientConnectionSender {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// Abort this client's WebSocket actor (same path as outgoing-queue kick).
+    ///
+    /// Used by public-mirror reconnect reset so downstream subscribers do not
+    /// observe a truncated re-seed. The actor's drop path runs
+    /// [`ClientConnection::disconnect`] / `disconnect_client` cleanup.
+    pub fn kick(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.abort_handle.abort();
+    }
+
     /// Send a message to the client. For data-related messages, you should probably use
     /// `BroadcastQueue::send` to ensure that the client sees data messages in a consistent order.
     ///

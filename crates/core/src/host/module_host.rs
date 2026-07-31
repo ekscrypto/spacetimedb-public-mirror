@@ -1891,6 +1891,48 @@ impl ModuleHost {
             .await
     }
 
+    /// Public-mirror reconnect cold-start: kick every downstream WS client and
+    /// truncate all mirrored user tables so the next subscribe session rebuilds
+    /// from upstream seeds with no stale rows or subscribers.
+    pub async fn reset_mirror_for_reconnect(
+        &self,
+        table_ids: impl IntoIterator<Item = TableId>,
+    ) -> Result<(), DBError> {
+        self.guard_closed()
+            .map_err(|_| DBError::Other(anyhow::anyhow!("module closed")))?;
+        if !self.is_public_mirror() {
+            return Err(DBError::Other(anyhow::anyhow!(
+                "reset_mirror_for_reconnect requires a public-mirror host"
+            )));
+        }
+
+        let kicked = self.subscriptions().kick_all_subscribers();
+        if kicked > 0 {
+            log::info!("public-mirror: kicked {kicked} downstream client(s) before reconnect re-seed");
+        }
+
+        let updates: Vec<super::public_mirror::MirroredUpdate> = table_ids
+            .into_iter()
+            .map(|table_id| super::public_mirror::MirroredUpdate {
+                provenance: None,
+                ops: vec![super::public_mirror::TableOps {
+                    table_id,
+                    deletes: Vec::new(),
+                    inserts: Vec::new(),
+                }],
+                is_seed: true,
+            })
+            .collect();
+        if updates.is_empty() {
+            return Ok(());
+        }
+        log::info!(
+            "public-mirror: flushing {} table(s) before reconnect re-seed",
+            updates.len()
+        );
+        self.apply_mirrored_updates(updates, None).await
+    }
+
     #[inline]
     pub fn info(&self) -> &ModuleInfo {
         &self.info

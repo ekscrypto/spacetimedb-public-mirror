@@ -4,12 +4,12 @@
 //!
 //! The socket loop **never awaits database work inline**. Decoded updates are
 //! pushed into an in-memory apply queue ([`Applier`]) and the in-flight apply
-//! future is polled *concurrently* with socket reads and client Pings (see
-//! [`SessionCtx::next_event`]). A slow or stuck multi-million-row insert
-//! therefore costs queue depth (bounded by [`LIVE_QUEUE_BYTES_MAX`]), never
-//! the WebSocket connection: Pings keep flowing, server Pings keep being
-//! answered, and reads keep draining the kernel buffer so upstream never sees
-//! a slow consumer.
+//! future is polled *concurrently* with socket reads, client Pings, and the
+//! application-level liveness probe (see [`SessionCtx::next_event`]). A slow
+//! or stuck multi-million-row insert therefore costs queue depth (bounded by
+//! [`LIVE_QUEUE_BYTES_MAX`]), never the WebSocket connection: Pings keep
+//! flowing, server Pings keep being answered, and reads keep draining the
+//! kernel buffer so upstream never sees a slow consumer.
 //!
 //! Apply ordering is preserved: the queue is strictly FIFO — seeds and live
 //! updates apply in arrival order. During initial subscribe, wire seeds are
@@ -34,8 +34,8 @@ use spacetimedb_client_api_messages::websocket::common::{
     QuerySetId, SERVER_MSG_COMPRESSION_TAG_BROTLI, SERVER_MSG_COMPRESSION_TAG_GZIP, SERVER_MSG_COMPRESSION_TAG_NONE,
 };
 use spacetimedb_client_api_messages::websocket::v1::{
-    BsatnFormat, ClientMessage, CompressableQueryUpdate, DatabaseUpdate, QueryUpdate, ServerMessage, SubscribeMulti,
-    TransactionUpdate, TransactionUpdateLight, UpdateStatus,
+    BsatnFormat, ClientMessage, CompressableQueryUpdate, DatabaseUpdate, OneOffQuery, QueryUpdate, ServerMessage,
+    SubscribeMulti, TransactionUpdate, TransactionUpdateLight, UpdateStatus,
 };
 use spacetimedb::util::thread_scheduling::deprioritize_mirror_background_thread;
 use spacetimedb_lib::{bsatn, ConnectionId, Identity, ProductValue, Timestamp};
@@ -60,6 +60,20 @@ const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
 /// keep the write path polled so tungstenite auto-Pongs flush during multi-GiB
 /// fragmented-message reassembly (un-split socket — never `futures::split`).
 const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Application-level liveness probe (matches legacy `relay-upstream`).
+///
+/// WS Ping/Pong only proves the TCP flow (or a proxy) is alive — not that the
+/// upstream *application* is still processing requests. Every
+/// [`PROBE_INTERVAL`] after live starts we send a v1 `OneOffQuery` ("SELECT 1");
+/// if no `OneOffQueryResponse` arrives within [`PROBE_TIMEOUT`], the session
+/// errors and reconnects. That catches the "up but silent" failure mode where
+/// connectivity stays `live` but transactions freeze.
+const PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_MESSAGE_ID: &[u8] = b"PUBLIC_MIRROR_PROBE";
+/// How often to poll an in-flight probe against [`PROBE_TIMEOUT`].
+const PROBE_DEADLINE_POLL: Duration = Duration::from_secs(5);
 
 /// Absolute per-table cap waiting for `SubscribeMultiApplied`. Safety net only:
 /// the *stall* timeout below is the operative one, so a slow-but-progressing
@@ -183,6 +197,8 @@ pub enum UpstreamError {
     Backlog { queued: usize, max: usize },
     #[error("upstream closed: {0}")]
     Closed(String),
+    #[error("liveness probe timed out — upstream did not respond to OneOffQuery within {0}s")]
+    ProbeTimeout(u64),
 }
 
 /// Applies a batch of updates (in order) into the local mirror database.
@@ -282,9 +298,26 @@ pub async fn connect_and_mirror(
     // Skip the immediate first tick.
     ping_interval.tick().await;
 
+    // Probe timers start dormant (`probe_enabled = false`) until the live
+    // loop; subscribe already has its own stall timeout on socket bytes.
+    let mut probe_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + PROBE_INTERVAL,
+        PROBE_INTERVAL,
+    );
+    probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut probe_deadline = tokio::time::interval(PROBE_DEADLINE_POLL);
+    probe_deadline.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick.
+    probe_deadline.tick().await;
+
     let mut ctx = SessionCtx {
         sock,
         ping: ping_interval,
+        probe: probe_interval,
+        probe_deadline,
+        probe_enabled: false,
+        probe_answered: true,
+        probe_sent_at: None,
         applier: Applier::default(),
         row_types,
         on_update,
@@ -326,19 +359,13 @@ where
 {
     ctx.await_identity_token().await?;
 
-    let already_done = completed_tables.lock().await.len();
-    if already_done > 0 {
-        log::info!(
-            "public-mirror: skipping {already_done} tables already seeded locally (reconnect resume)"
-        );
-        ctx.status
-            .set_table_live(u32::try_from(already_done).unwrap_or(u32::MAX));
-    }
+    // Subscriptions are per WebSocket connection. Always SubscribeMulti every
+    // table on a new socket. `completed_tables` is within-session seed-apply
+    // bookkeeping only — the reconnect loop clears it and cold-resets local
+    // state (kick clients + flush tables) before re-acquiring the subscribe gate.
+    completed_tables.lock().await.clear();
 
     for (idx, table) in tables.iter().enumerate() {
-        if completed_tables.lock().await.contains(table) {
-            continue;
-        }
         if let Err(e) = subscribe_table(ctx, table, idx, tables.len()).await {
             *failed_table = Some(table.clone());
             return Err(e);
@@ -433,7 +460,7 @@ where
         match ctx.next_event().await? {
             Event::Frame(frame) => ctx.handle_background_frame(frame)?,
             Event::Applied => ctx.flush_completed_seeds(completed_tables).await,
-            Event::Tick => {}
+            Event::Tick | Event::Probe => {}
         }
     }
     ctx.flush_completed_seeds(completed_tables).await;
@@ -448,6 +475,8 @@ enum Event {
     Applied,
     /// The ping interval ticked (a client Ping was sent).
     Tick,
+    /// The liveness probe was sent or its deadline was checked (no frame).
+    Probe,
 }
 
 /// Raw select outcome, before any `SessionCtx` bookkeeping. Keeping borrows out
@@ -456,6 +485,8 @@ enum RawEvent {
     ApplyFinished(Result<(), anyhow::Error>),
     Frame(Bytes),
     Tick,
+    ProbeSend,
+    ProbeCheck,
 }
 
 /// One connected upstream session: socket, ping timer, apply queue, and
@@ -463,6 +494,15 @@ enum RawEvent {
 struct SessionCtx<S> {
     sock: WebSocketStream<S>,
     ping: tokio::time::Interval,
+    /// Fires every [`PROBE_INTERVAL`] once [`Self::probe_enabled`].
+    probe: tokio::time::Interval,
+    /// Polls an in-flight probe against [`PROBE_TIMEOUT`].
+    probe_deadline: tokio::time::Interval,
+    /// Armed only in the live update loop (after all tables subscribed).
+    probe_enabled: bool,
+    /// `true` = no probe in flight (or last probe was answered).
+    probe_answered: bool,
+    probe_sent_at: Option<tokio::time::Instant>,
     applier: Applier,
     row_types: HashMap<String, ProductType>,
     on_update: ApplyFn,
@@ -482,21 +522,31 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     /// Wait for the next session event, servicing everything concurrently:
-    /// socket reads (which also flush auto-Pongs), client Pings, and the
-    /// in-flight apply future. **Never blocks socket servicing on an apply.**
+    /// socket reads (which also flush auto-Pongs), client Pings, the
+    /// application-level liveness probe (when armed), and the in-flight apply
+    /// future. **Never blocks socket servicing on an apply.**
     async fn next_event(&mut self) -> Result<Event, UpstreamError> {
         let Self {
-            sock, ping, applier, ..
+            sock,
+            ping,
+            probe,
+            probe_deadline,
+            probe_enabled,
+            applier,
+            ..
         } = self;
+        let probe_armed = *probe_enabled;
         // Biased order: finished applies first (frees the queue), then the ping
         // timer (so a continuous stream of ready frames cannot postpone client
-        // Pings indefinitely), then the socket.
+        // Pings indefinitely), then the liveness probe, then the socket.
         let raw = tokio::select! {
             biased;
             result = poll_in_flight(&mut applier.in_flight), if applier.in_flight.is_some() => {
                 RawEvent::ApplyFinished(result)
             }
             _ = ping.tick() => RawEvent::Tick,
+            _ = probe.tick(), if probe_armed => RawEvent::ProbeSend,
+            _ = probe_deadline.tick(), if probe_armed => RawEvent::ProbeCheck,
             msg = next_binary(sock) => RawEvent::Frame(msg?),
         };
         match raw {
@@ -509,6 +559,26 @@ where
             RawEvent::Tick => {
                 send_client_ping(&mut self.sock).await?;
                 Ok(Event::Tick)
+            }
+            RawEvent::ProbeSend => {
+                send_liveness_probe(&mut self.sock).await?;
+                self.probe_answered = false;
+                self.probe_sent_at = Some(tokio::time::Instant::now());
+                Ok(Event::Probe)
+            }
+            RawEvent::ProbeCheck => {
+                if !self.probe_answered {
+                    if let Some(sent_at) = self.probe_sent_at {
+                        if sent_at.elapsed() >= PROBE_TIMEOUT {
+                            log::warn!(
+                                "public-mirror: liveness probe timed out after {}s — forcing reconnect",
+                                PROBE_TIMEOUT.as_secs()
+                            );
+                            return Err(UpstreamError::ProbeTimeout(PROBE_TIMEOUT.as_secs()));
+                        }
+                    }
+                }
+                Ok(Event::Probe)
             }
         }
     }
@@ -532,6 +602,15 @@ where
                     self.enqueue_live(update)?;
                 }
             }
+            ServerMessage::OneOffQueryResponse(_) => {
+                // Liveness probe reply — any response (ok or error) proves the
+                // upstream application is still processing requests.
+                if !self.probe_answered {
+                    log::debug!("public-mirror: liveness probe response received");
+                    self.probe_answered = true;
+                    self.probe_sent_at = None;
+                }
+            }
             ServerMessage::SubscriptionError(err) => {
                 return Err(UpstreamError::Subscription(err.error.to_string()));
             }
@@ -548,7 +627,8 @@ where
         Ok(())
     }
 
-    /// Move completed seed table names into `completed_tables` (reconnect resume).
+    /// Move completed seed table names into `completed_tables` (within-session
+    /// apply bookkeeping; cleared on reconnect cold-reset).
     async fn flush_completed_seeds(&mut self, completed_tables: &Arc<Mutex<HashSet<String>>>) {
         for table in self.applier.drain_completed_seed_tables() {
             completed_tables.lock().await.insert(table);
@@ -576,7 +656,7 @@ where
                         other => self.route_background(other)?,
                     }
                 }
-                Event::Applied | Event::Tick => {}
+                Event::Applied | Event::Tick | Event::Probe => {}
             }
         }
     }
@@ -629,7 +709,7 @@ where
                         }
                     }
                 }
-                Event::Applied | Event::Tick => {}
+                Event::Applied | Event::Tick | Event::Probe => {}
             }
         }
     }
@@ -680,7 +760,15 @@ where
     }
 
     /// Live update loop — read, decode, enqueue; applies complete concurrently.
+    /// Arms the application-level OneOffQuery liveness probe (legacy relay
+    /// behaviour) so a silent-but-open upstream WebSocket forces reconnect.
     async fn live_loop(&mut self) -> Result<(), UpstreamError> {
+        self.probe_enabled = true;
+        self.probe_answered = true;
+        self.probe_sent_at = None;
+        // First probe fires one full interval after live starts.
+        self.probe
+            .reset_at(tokio::time::Instant::now() + PROBE_INTERVAL);
         loop {
             if let Event::Frame(frame) = self.next_event().await? {
                 self.handle_background_frame(frame)?;
@@ -942,6 +1030,25 @@ where
     sock.send(Message::Ping(Bytes::new()))
         .await
         .map_err(UpstreamError::from)
+}
+
+async fn send_liveness_probe<S>(sock: &mut WebSocketStream<S>) -> Result<(), UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = encode_one_off_query(PROBE_MESSAGE_ID, "SELECT 1")?;
+    log::debug!("public-mirror: sending liveness probe");
+    sock.send(Message::Binary(frame.into()))
+        .await
+        .map_err(UpstreamError::from)
+}
+
+fn encode_one_off_query(message_id: &[u8], query: &str) -> Result<Vec<u8>, UpstreamError> {
+    let msg = ClientMessage::<Box<[u8]>>::OneOffQuery(OneOffQuery {
+        message_id: message_id.to_vec().into_boxed_slice(),
+        query_string: query.to_string().into_boxed_str(),
+    });
+    bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
 }
 
 enum SeedWaitDecode {
