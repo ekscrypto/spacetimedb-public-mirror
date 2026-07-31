@@ -963,7 +963,7 @@ impl ModuleSubscriptions {
         self.remove_v2_subscription_inner(Some(instance), sender, auth, request, timer, _assert)
     }
 
-    fn remove_v2_subscription_inner<I: WasmInstance>(
+    pub(crate) fn remove_v2_subscription_inner<I: WasmInstance>(
         &self,
         _instance: Option<&mut RefInstance<I>>,
         sender: Arc<ClientConnectionSender>,
@@ -1264,7 +1264,11 @@ impl ModuleSubscriptions {
     ) -> Result<Option<ExecutionMetrics>, DBError> {
         match host {
             Some(host) => host.call_view_add_v2_subscription(sender, auth, request, timer).await,
-            None => panic!("v2 subscriptions without a module host are not supported yet"),
+            None => self
+                .add_v2_subscription_inner::<host::wasmtime::WasmtimeInstance>(
+                    None, sender, auth, request, timer, _assert,
+                )
+                .map(|(metrics, _)| metrics),
         }
     }
     /// Add a subscription consisting of multiple queries.
@@ -1320,7 +1324,7 @@ impl ModuleSubscriptions {
         self.add_multi_subscription_inner(Some(instance), sender, auth, request, timer, _assert)
     }
 
-    fn add_v2_subscription_inner<I: WasmInstance>(
+    pub(crate) fn add_v2_subscription_inner<I: WasmInstance>(
         &self,
         instance: Option<&mut RefInstance<I>>,
         sender: Arc<ClientConnectionSender>,

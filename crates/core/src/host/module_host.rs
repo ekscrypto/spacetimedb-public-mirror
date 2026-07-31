@@ -2179,10 +2179,24 @@ impl ModuleHost {
                 request,
                 timer,
             } => Ok(subs.remove_multi_subscription(sender, auth, request, timer)?),
-            // public-mirror-v1 is intentionally v1-scoped; v2 subscriptions need a module host.
-            ViewCommand::AddSubscriptionV2 { .. } | ViewCommand::RemoveSubscriptionV2 { .. } => Err(DBError::Other(
-                anyhow::anyhow!("public-mirror-v1 does not support v2 websocket subscriptions"),
-            )),
+            // v2 Subscribe/Unsubscribe are read-only view ops; public-mirror has no
+            // Wasm module, so run the inner path with instance=None (same as v1 multi).
+            ViewCommand::AddSubscriptionV2 {
+                sender,
+                auth,
+                request,
+                _timer: timer,
+            } => subs
+                .add_v2_subscription_inner::<WasmtimeInstance>(None, sender, auth, request, timer, None)
+                .map(|(metrics, _)| metrics),
+            ViewCommand::RemoveSubscriptionV2 {
+                sender,
+                auth,
+                request,
+                timer,
+            } => subs
+                .remove_v2_subscription_inner::<WasmtimeInstance>(None, sender, auth, request, timer, None)
+                .map(|(metrics, _)| metrics),
         }
     }
 
