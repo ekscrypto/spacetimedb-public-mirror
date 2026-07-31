@@ -1,7 +1,85 @@
 > **Unofficial fork.** This is [`ekscrypto/spacetimedb-public-mirror`](https://github.com/ekscrypto/spacetimedb-public-mirror),
-> a public BSL fork of Clockwork Labs SpacetimeDB **v2.7.1** that adds
-> `--public-mirror-v1`. See [`FORK.md`](FORK.md). Not affiliated with Clockwork Labs;
-> not intended for upstream merge.
+> a public BSL fork of Clockwork Labs SpacetimeDB **v2.7.1**. Not affiliated with
+> Clockwork Labs; not intended for upstream merge. Deep dive: [`FORK.md`](FORK.md).
+
+## Why this fork exists
+
+Upstream SpacetimeDB is a module host: you publish WASM, clients call reducers,
+and the engine owns durable state. This fork adds **`--public-mirror-v1`**: an
+in-memory mode that **mirrors a remote v1 BSATN database** and fans out committed
+`TransactionUpdate`s to local subscribers **with the original upstream reducer
+call stack / provenance** (`reducer_call`, caller identity/connection, timestamp).
+
+That provenance exists on the wire **only in protocol v1**, so mirroring is
+intentionally v1-scoped. The goal is a drop-in local SpacetimeDB endpoint that
+looks like the upstream shard to downstream `v1.bsatn.spacetimedb` clients,
+without re-applying mutations through synthetic reducers.
+
+## Mirroring controls
+
+Enable with `spacetimedb-standalone start --public-mirror-v1` plus one or more
+`--mirror` targets. Key flags (all require `--public-mirror-v1`):
+
+| Flag | Role |
+|------|------|
+| `--mirror <url>/<db>` | Upstream to mirror (repeatable). Local clients select by database name. |
+| `--mirror-token` / `--mirror-token-file` | Upstream bearer JWT (also `BITCRAFT_TOKEN`, `MIRROR_TOKEN`, `RELAY_UPSTREAM_TOKEN`, `MIRROR_TOKEN_FILE`). Shared across all mirrors. |
+| `--mirror-table <name>` | Limit upstream subscribe set (repeatable; default: all public user tables). Shared across all mirrors. |
+| `--mirror-subscribe-concurrency <n>` | Max mirrors that may run initial setup at once (default **1**). Slot held for connect + every table seed + local apply; released when that mirror goes `live`. |
+| `--coordinator-socket <path>` | Optional relay-coordinator Unix socket for cross-process subscribe serialization. |
+| `--mirror-status-listen-addr <addr>` | Isolated readiness listener (default `127.0.0.1:<main-port+1>`). |
+| `--reject-one-off-query` | Also reject `OneOffQuery` (allowed by default). `CallReducer` / `CallProcedure` are always rejected. |
+
+Status and per-table seed progress: `GET /v1/mirrors` (main port and the status
+sidecar). Example command line and seed/reconnect behavior: [`FORK.md`](FORK.md).
+
+## Caveat: clients stay offline until every mirror is live
+
+In `--public-mirror-v1` mode, **downstream WebSocket subscribe is rejected with
+HTTP 503** until **every** configured mirror reports connectivity `live` on
+`GET /v1/mirrors`. Partial readiness is not enough — if any mirror is still
+`waiting` / `connecting` / `subscribing` / `disconnected`, all client connects
+fail with a message pointing at `/v1/mirrors`.
+
+This is intentional: seed apply can skip subscription eval / broadcast while
+catching up, without risk that a client sees a half-seeded database or misses
+updates. Poll the **status sidecar** during large seeds — the main HTTP port may
+not respond until seed apply finishes. Once all mirrors are `live`, clients are
+accepted; a later disconnect on any mirror closes the gate again until that
+mirror is back to `live`.
+
+## Provisioning differences (mirror vs normal standalone)
+
+| Normal standalone | `--public-mirror-v1` |
+|-------------------|----------------------|
+| You `spacetime publish` a module / schema | Schema is **fetched from upstream** at bootstrap; databases are registered as `HostType::Mirror` |
+| Durable disk storage by default | **Forced in-memory** storage (no durable mirror state across restarts) |
+| You choose database names / identities | Local DB name is the upstream database name; identity is derived (`public-mirror-v1` claims) |
+| Clients may connect as soon as the process listens | Clients **blocked until all mirrors are `live`** (see above) |
+| Full reducer / procedure surface | **Read-only fan-out**: `CallReducer` / `CallProcedure` rejected; optional `OneOffQuery` reject |
+
+You do not provision by publishing WASM into this process. You start with
+`--mirror` URLs, a token, optional `--mirror-table` filters, JWT key paths for
+local client auth, and a data dir (control metadata / logs — not the mirrored
+row store).
+
+## Operational differences in mirroring mode
+
+- **One process, many DBs.** Repeat `--mirror`; one `--listen-addr` serves all
+  mirrored names. Each DB has its own JobCores worker.
+- **Subscribe gate.** Initial connect/seed is serialized by
+  `--mirror-subscribe-concurrency` (and optionally `--coordinator-socket`). Live
+  mirrors do not hold a slot; reconnect must reacquire one.
+- **Readiness plane.** Prefer the isolated `/v1/mirrors` sidecar for orchestration
+  and load-balancer health while seeds are in progress.
+- **Reconnect / re-seed.** Seeds are idempotent (table truncate + insert in one
+  transaction). Large Brotli-compressed seeds use a stall-based subscribe timeout;
+  see [`FORK.md`](FORK.md).
+- **Not a general SpacetimeDB replacement.** No upstream merge path; BSL terms
+  still apply. For BitCraft relay fleet context and sibling checkouts, see
+  [`FORK.md`](FORK.md).
+
+---
 
 <p align="center">
     <a href="https://spacetimedb.com#gh-dark-mode-only" target="_blank">
