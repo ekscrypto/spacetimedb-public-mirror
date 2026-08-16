@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use spacetimedb_lib::Identity;
 
 use crate::NodeDelegate;
 
@@ -31,6 +32,10 @@ pub enum SubscribePhase {
 pub struct MirrorStatusSnapshot {
     pub host: String,
     pub database: String,
+    /// Deterministic identity of the local mirror database
+    /// (`Identity::from_claims("public-mirror-v1", database)`); used to gate
+    /// client acceptance per database.
+    pub database_identity: Identity,
     pub connectivity: MirrorConnectivity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_since: Option<String>,
@@ -75,16 +80,24 @@ pub async fn mirrors<S: NodeDelegate>(State(ctx): State<S>) -> impl IntoResponse
     Json(ctx.mirror_statuses())
 }
 
-/// Whether downstream clients may connect to this node.
+/// Whether downstream clients may connect to the database identified by
+/// `database_identity`.
 ///
-/// Non-mirror deployments (empty `/v1/mirrors` registry) always accept clients.
-/// In `--public-mirror-v1` mode, clients are rejected until every mirrored
-/// database reports [`MirrorConnectivity::Live`] — so seed apply can skip
-/// subscription eval / broadcast with no risk of missing updates. Status
-/// polling via `GET /v1/mirrors` is unaffected.
-pub fn public_mirror_accepts_clients(statuses: &MirrorsResponse) -> bool {
-    let mirrors = &statuses.mirrors;
-    mirrors.is_empty() || mirrors.iter().all(|m| m.connectivity == MirrorConnectivity::Live)
+/// Non-mirror deployments (empty `/v1/mirrors` registry) always accept
+/// clients, as do databases without a mirror entry. In `--public-mirror-v1`
+/// mode, a database accepts clients iff *its own* mirror reports
+/// [`MirrorConnectivity::Live`] — one region still syncing or reconnecting
+/// must not block clients of healthy regions. Status polling via
+/// `GET /v1/mirrors` is unaffected.
+pub fn public_mirror_accepts_clients_for(
+    statuses: &MirrorsResponse,
+    database_identity: &Identity,
+) -> bool {
+    statuses
+        .mirrors
+        .iter()
+        .find(|m| m.database_identity == *database_identity)
+        .map_or(true, |m| m.connectivity == MirrorConnectivity::Live)
 }
 
 pub fn router<S>() -> axum::Router<S>
@@ -99,10 +112,15 @@ where
 mod tests {
     use super::*;
 
-    fn snap(connectivity: MirrorConnectivity) -> MirrorStatusSnapshot {
+    fn db_id(database: &str) -> Identity {
+        Identity::from_claims("public-mirror-v1", database)
+    }
+
+    fn snap(connectivity: MirrorConnectivity, database: &str) -> MirrorStatusSnapshot {
         MirrorStatusSnapshot {
             host: "h".into(),
-            database: "db".into(),
+            database: database.into(),
+            database_identity: db_id(database),
             connectivity,
             connected_since: None,
             disconnected_since: None,
@@ -124,22 +142,41 @@ mod tests {
 
     #[test]
     fn accepts_clients_when_not_mirroring() {
-        assert!(public_mirror_accepts_clients(&MirrorsResponse::default()));
+        assert!(public_mirror_accepts_clients_for(&MirrorsResponse::default(), &db_id("db")));
     }
 
     #[test]
-    fn rejects_clients_until_all_mirrors_live() {
+    fn live_region_accepts_while_other_region_syncs() {
         let statuses = MirrorsResponse {
             mirrors: vec![
-                snap(MirrorConnectivity::Live),
-                snap(MirrorConnectivity::Subscribing),
+                snap(MirrorConnectivity::Live, "bitcraft-live-7"),
+                snap(MirrorConnectivity::Subscribing, "bitcraft-live-8"),
             ],
         };
-        assert!(!public_mirror_accepts_clients(&statuses));
+        assert!(public_mirror_accepts_clients_for(&statuses, &db_id("bitcraft-live-7")));
+        assert!(!public_mirror_accepts_clients_for(&statuses, &db_id("bitcraft-live-8")));
+    }
 
+    #[test]
+    fn rejects_target_until_its_own_mirror_is_live() {
+        for conn in [
+            MirrorConnectivity::Waiting,
+            MirrorConnectivity::Connecting,
+            MirrorConnectivity::Subscribing,
+            MirrorConnectivity::Disconnected,
+        ] {
+            let statuses = MirrorsResponse { mirrors: vec![snap(conn, "db")] };
+            assert!(!public_mirror_accepts_clients_for(&statuses, &db_id("db")));
+        }
+        let statuses = MirrorsResponse { mirrors: vec![snap(MirrorConnectivity::Live, "db")] };
+        assert!(public_mirror_accepts_clients_for(&statuses, &db_id("db")));
+    }
+
+    #[test]
+    fn accepts_databases_without_a_mirror_entry() {
         let statuses = MirrorsResponse {
-            mirrors: vec![snap(MirrorConnectivity::Live), snap(MirrorConnectivity::Live)],
+            mirrors: vec![snap(MirrorConnectivity::Subscribing, "bitcraft-live-7")],
         };
-        assert!(public_mirror_accepts_clients(&statuses));
+        assert!(public_mirror_accepts_clients_for(&statuses, &db_id("bitcraft-live-global")));
     }
 }

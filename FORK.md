@@ -78,6 +78,13 @@ tables). Each mirrored database runs on its own JobCores thread.
 Clients connect to the local mirror by database name (`bitcraft-live-1`,
 `bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
+Client WebSocket upgrades are gated **per database**: a database accepts
+connections once *its own* mirror is `live`, and is rejected with 503 only
+while that mirror is still syncing or reconnecting. Other mirrors being
+`waiting`/`subscribing`/`disconnected` does not affect a healthy region's
+clients. (Historically the gate required *all* mirrors to be live, which
+coupled every region to the slowest one in multi-mirror deployments.)
+
 Initial connect/subscribe is gated by `--mirror-subscribe-concurrency` (default
 **1**): only that many mirrors may **set up mirroring** at once. A slot is
 acquired before connecting and held for the entire setup phase — connect, every

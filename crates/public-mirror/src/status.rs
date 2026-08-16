@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use spacetimedb_lib::Identity;
 use url::Url;
 
 pub use spacetimedb_client_api::routes::mirrors::{
@@ -63,6 +64,9 @@ impl Default for ByteCounter {
 struct MirrorStatusInner {
     host: String,
     database: String,
+    /// Deterministic identity of the local mirror database — matches what the
+    /// client-api subscribe handler resolved, so gating is per database.
+    database_identity: Identity,
     connectivity: MirrorConnectivity,
     connected_since: Option<SystemTime>,
     disconnected_since: Option<SystemTime>,
@@ -143,6 +147,7 @@ impl MirrorStatusInner {
         MirrorStatusSnapshot {
             host: self.host.clone(),
             database: self.database.clone(),
+            database_identity: self.database_identity,
             connectivity: self.connectivity,
             connected_since,
             disconnected_since,
@@ -175,11 +180,22 @@ impl MirrorStatusRegistry {
     }
 
     /// Register a mirror and return a handle for the upstream loop to update.
-    pub fn register(&self, host: &Url, database: impl Into<String>, tables_total: u32) -> MirrorStatusHandle {
+    ///
+    /// `database_identity` is the deterministic identity the mirror database
+    /// was bootstrapped with (see `bootstrap_public_mirror`); it links status
+    /// entries to the database a client is subscribing to.
+    pub fn register(
+        &self,
+        host: &Url,
+        database: impl Into<String>,
+        database_identity: Identity,
+        tables_total: u32,
+    ) -> MirrorStatusHandle {
         let database = database.into();
         let inner = Arc::new(Mutex::new(MirrorStatusInner {
             host: host_origin(host),
             database,
+            database_identity,
             connectivity: MirrorConnectivity::Disconnected,
             connected_since: None,
             disconnected_since: Some(SystemTime::now()),
@@ -447,8 +463,8 @@ mod tests {
     fn register_two_mirrors_and_drive_phases() {
         let reg = MirrorStatusRegistry::new();
         let host = Url::parse("wss://ea.example").unwrap();
-        let a = reg.register(&host, "bitcraft-live-1", 2);
-        let b = reg.register(&host, "bitcraft-live-global", 12);
+        let a = reg.register(&host, "bitcraft-live-1", Identity::from_claims("public-mirror-v1", "bitcraft-live-1"), 2);
+        let b = reg.register(&host, "bitcraft-live-global", Identity::from_claims("public-mirror-v1", "bitcraft-live-global"), 12);
 
         a.set_connecting();
         a.set_connected();
@@ -466,6 +482,7 @@ mod tests {
 
         let m0 = &snap.mirrors[0];
         assert_eq!(m0.database, "bitcraft-live-1");
+        assert!(m0.database_identity == Identity::from_claims("public-mirror-v1", "bitcraft-live-1"));
         assert_eq!(m0.connectivity, MirrorConnectivity::Live);
         assert!(m0.connected_since.is_some());
         assert!(m0.disconnected_since.is_none());
@@ -494,7 +511,7 @@ mod tests {
     fn waiting_clears_on_connect() {
         let reg = MirrorStatusRegistry::new();
         let host = Url::parse("wss://ea.example").unwrap();
-        let h = reg.register(&host, "db", 3);
+        let h = reg.register(&host, "db", Identity::from_claims("public-mirror-v1", "db"), 3);
         h.set_waiting();
         assert_eq!(reg.snapshot().mirrors[0].connectivity, MirrorConnectivity::Waiting);
         assert_eq!(reg.snapshot().mirrors[0].tables_live, 0);
@@ -506,7 +523,7 @@ mod tests {
     fn transactions_accumulate_across_reconnect() {
         let reg = MirrorStatusRegistry::new();
         let host = Url::parse("wss://ea.example").unwrap();
-        let h = reg.register(&host, "db", 1);
+        let h = reg.register(&host, "db", Identity::from_claims("public-mirror-v1", "db"), 1);
         h.set_live();
         h.inc_transactions();
         h.set_disconnected(SystemTime::now() + Duration::from_secs(1));
@@ -529,7 +546,7 @@ mod tests {
     fn subscribe_progress_exposes_bytes_and_phase() {
         let reg = MirrorStatusRegistry::new();
         let host = Url::parse("wss://ea.example").unwrap();
-        let h = reg.register(&host, "db", 10);
+        let h = reg.register(&host, "db", Identity::from_claims("public-mirror-v1", "db"), 10);
         let counter = ByteCounter::new();
         h.attach_byte_counter(counter.clone());
         h.set_connecting();

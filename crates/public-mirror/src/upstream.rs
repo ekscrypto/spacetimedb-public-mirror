@@ -1362,7 +1362,12 @@ mod tests {
 
     fn test_status() -> MirrorStatusHandle {
         let reg = MirrorStatusRegistry::new();
-        reg.register(&Url::parse("wss://test.example").unwrap(), "db", 1)
+        reg.register(
+            &Url::parse("wss://test.example").unwrap(),
+            "db",
+            Identity::from_claims("public-mirror-v1", "db"),
+            1,
+        )
     }
 
     fn live_update(n_tx: bool, insert_bytes: usize) -> UpstreamUpdate {

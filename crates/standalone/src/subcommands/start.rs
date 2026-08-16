@@ -825,7 +825,7 @@ async fn bootstrap_public_mirror(
     };
     let status = ctx
         .mirror_status_registry()
-        .register(upstream_url, mirror_database, tables_total);
+        .register(upstream_url, mirror_database, database_identity, tables_total);
 
     let mirror_cfg = PublicMirrorConfig {
         upstream: upstream_url.clone(),

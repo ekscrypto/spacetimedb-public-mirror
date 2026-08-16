@@ -208,8 +208,8 @@ pub async fn run_public_mirror_loop(
         }
         let sleep_for = Duration::from_secs(backoff_secs);
         let next_attempt_at = SystemTime::now() + sleep_for;
-        // Mark disconnected first so `public_mirror_accepts_clients` rejects
-        // new WS until this (and every) mirror is live again.
+        // Mark disconnected first so `public_mirror_accepts_clients_for`
+        // rejects new WS for this database until its mirror is live again.
         status.set_disconnected(next_attempt_at);
         match result {
             Ok(()) => {
